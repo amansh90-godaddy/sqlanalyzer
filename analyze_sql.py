@@ -157,15 +157,32 @@ class SQLAnalyzer:
             )
 
             if result.returncode == 0:
-                self.jira_context = result.stdout.strip()
-                if 'JIRA_NOT_FOUND' in self.jira_context:
-                    print(f"⚠️  Could not access JIRA ticket {self.jira_ticket}")
+                # Debug: Show what Claude Code returned
+                print(f"🔍 MCP Response preview: {result.stdout[:500] if result.stdout else '(empty)'}")
+
+                self.jira_context = result.stdout.strip() if result.stdout else ""
+
+                # Check if we got actual JIRA context
+                if not self.jira_context:
+                    print(f"⚠️  JIRA context is empty - MCP may not be responding")
+                    self.jira_context = f"JIRA ticket {self.jira_ticket} referenced (MCP returned empty response)"
+                elif 'JIRA_NOT_FOUND' in self.jira_context:
+                    print(f"⚠️  Could not access JIRA ticket {self.jira_ticket} - Ticket not found or no access")
                     self.jira_context = f"JIRA ticket {self.jira_ticket} referenced but context not available"
+                elif len(self.jira_context) < 50:
+                    print(f"⚠️  JIRA context suspiciously short ({len(self.jira_context)} chars) - may not have fetched correctly")
+                    print(f"    Full response: {self.jira_context}")
                 else:
                     print(f"✅ Successfully fetched JIRA context ({len(self.jira_context)} chars)")
+                    print(f"    Preview: {self.jira_context[:200]}...")
+
                 return True
             else:
                 print(f"⚠️  Warning: Could not fetch JIRA context (exit code {result.returncode})")
+                if result.stderr:
+                    print(f"    stderr: {result.stderr[:300]}")
+                if result.stdout:
+                    print(f"    stdout: {result.stdout[:300]}")
                 self.jira_context = f"JIRA ticket {self.jira_ticket} referenced (context unavailable)"
                 return True  # Continue anyway
 
@@ -242,6 +259,13 @@ Output ONLY the SQL validation script, no explanatory text before or after."""
                     print(f"   stderr: {result.stderr[:200]}")
                 return False
 
+            # Check if Claude returned any output
+            if result.stdout is None:
+                print(f"❌ Error: Claude returned no output")
+                if result.stderr:
+                    print(f"   stderr: {result.stderr[:200]}")
+                return False
+
             validation_sql = result.stdout.strip()
 
             # Save to file
@@ -305,17 +329,25 @@ Output ONLY the markdown documentation, no explanatory text before or after."""
             env = os.environ.copy()
             env.pop('CLAUDECODE', None)
 
+            # Increased timeout for complex queries (was 120s)
             result = subprocess.run(
                 [self.claude_cli, 'code', '--print', '-'],
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=240,
                 env=env
             )
 
             if result.returncode != 0:
                 print(f"❌ Error: Claude Code failed (exit code {result.returncode})")
+                if result.stderr:
+                    print(f"   stderr: {result.stderr[:200]}")
+                return False
+
+            # Check if Claude returned any output
+            if result.stdout is None:
+                print(f"❌ Error: Claude returned no output")
                 if result.stderr:
                     print(f"   stderr: {result.stderr[:200]}")
                 return False
@@ -405,17 +437,25 @@ Output ONLY the markdown improvements document, no explanatory text before or af
             env = os.environ.copy()
             env.pop('CLAUDECODE', None)
 
+            # Increased timeout for complex queries (was 120s)
             result = subprocess.run(
                 [self.claude_cli, 'code', '--print', '-'],
                 input=prompt,
                 capture_output=True,
                 text=True,
-                timeout=120,
+                timeout=240,
                 env=env
             )
 
             if result.returncode != 0:
                 print(f"❌ Error: Claude Code failed (exit code {result.returncode})")
+                if result.stderr:
+                    print(f"   stderr: {result.stderr[:200]}")
+                return False
+
+            # Check if Claude returned any output
+            if result.stdout is None:
+                print(f"❌ Error: Claude returned no output")
                 if result.stderr:
                     print(f"   stderr: {result.stderr[:200]}")
                 return False
