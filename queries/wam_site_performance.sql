@@ -506,4 +506,4 @@ a.top_ranked_tracking_code = b.item_tracking_code
 ORDER BY sessions DESC)
 
 
--- select * from dna_sandbox.wam_site_marketing_v1 where top_ranked_tracking_code <> 'Not attributed'
+-- select * from dna_sandbox.wam_site_marketing_v1 where top_ranked_tracking_code <> 'Not attributed'-- Last updated: 2026-03-09
