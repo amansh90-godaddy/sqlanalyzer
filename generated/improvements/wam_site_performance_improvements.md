@@ -1,903 +1,833 @@
-# SQL Query Analysis: WAM Site Performance Tracking
-## Improvements & Optimization Recommendations
-
----
+# SQL Query Analysis: WAM Site Performance Optimization Report
 
 ## 1. Performance Optimizations
 
-### 1.1 Replace CASE WHEN Cascade with Lookup Table Join
-**Issue:** The 253-line CASE statement with LIKE pattern matching is the primary performance bottleneck causing timeouts (JIRA HAT-3917).
+### 1.1 Critical: Replace Massive CASE WHEN with Table-Driven Lookup
+**Impact: HIGH** | **Effort: Medium** | **Estimated Performance Gain: 50-80%**
 
-**Current Approach:**
+**Issue**: The 253-line CASE WHEN statement with LIKE pattern matching is the single biggest performance bottleneck in this query.
+
 ```sql
+-- Current approach (SLOW):
 CASE
     WHEN all_itc_combined LIKE '%|~|upp_f2p_upgrade|~|%' THEN 'upp_f2p_upgrade'
     WHEN all_itc_combined LIKE '%|~|slp_wsb_ft_nocc_config|~|%' THEN 'slp_wsb_ft_nocc_config'
-    -- ... 251 more WHEN clauses
+    -- ... 251 more conditions
 END
 ```
 
-**Recommended Approach:**
+**Recommended Solution**: Create a tracking code ranking table with pre-computed patterns:
+
 ```sql
--- Create a permanent tracking code reference table
-CREATE TABLE dev.ba_corporate.tracking_code_ranking (
+-- Create persistent lookup table:
+CREATE TABLE dev.ba_corporate.tracking_code_rankings (
     tracking_code VARCHAR(200) PRIMARY KEY,
     rank_order INT NOT NULL,
-    gcr_amount DECIMAL(15,2),
-    unit_qty INT
+    gcr_value DECIMAL(18,2),
+    quantity INT,
+    is_active BOOLEAN DEFAULT TRUE,
+    last_updated TIMESTAMP
 ) SORTKEY(rank_order);
 
--- Use LATERAL join with SPLIT_TO_ARRAY for efficient matching
-WITH itc_expanded AS (
+-- Populate with current rankings
+INSERT INTO dev.ba_corporate.tracking_code_rankings VALUES
+('upp_f2p_upgrade', 1, 37541749.14, NULL, TRUE, CURRENT_TIMESTAMP),
+('slp_wsb_ft_nocc_config', 2, 1597432.08, NULL, TRUE, CURRENT_TIMESTAMP),
+-- ... etc
+
+-- Replace CASE WHEN with join + window function:
+tracking_code_match AS (
     SELECT 
-        session_id,
-        website_activity_mst_date,
-        -- ... other fields
-        itc_value
-    FROM base_data,
-    LATERAL SPLIT_TO_ARRAY(
-        REGEXP_REPLACE(
-            item_tracking_code_payment_attempt_list || ',' ||
-            item_tracking_code_begin_checkout_list || ',' ||
-            item_tracking_code_add_to_cart_list || ',' ||
-            item_tracking_code_click_list || ',' ||
-            item_tracking_code_impression_list,
-            ',+', ','
-        ),
-        ','
-    ) AS itc_value
+        tre.*,
+        tcr.tracking_code,
+        tcr.rank_order,
+        ROW_NUMBER() OVER (PARTITION BY tre.session_id ORDER BY tcr.rank_order) as match_rank
+    FROM top_ranked_extract tre
+    CROSS JOIN dev.ba_corporate.tracking_code_rankings tcr
+    WHERE tcr.is_active = TRUE
+        AND tre.all_itc_combined LIKE '%|~|' || tcr.tracking_code || '|~|%'
+),
+best_match AS (
+    SELECT *
+    FROM tracking_code_match
+    WHERE match_rank = 1
 )
-SELECT 
-    i.*,
-    MIN(r.rank_order) as best_rank,
-    FIRST_VALUE(r.tracking_code) OVER (
-        PARTITION BY i.session_id 
-        ORDER BY r.rank_order
-    ) as top_ranked_tracking_code
-FROM itc_expanded i
-LEFT JOIN dev.ba_corporate.tracking_code_ranking r 
-    ON i.itc_value = r.tracking_code
 ```
 
-**Impact:** ðŸ”´ **HIGH** - Expected 50-90% query time reduction  
-**Trade-offs:** Requires creating and maintaining a reference table
+**Trade-offs**: Requires maintaining a separate table, but enables dynamic updates without query changes.
 
 ---
 
-### 1.2 Eliminate Redundant String Concatenation
-**Issue:** The `all_itc_combined` field concatenates all ITC fields on every row, then performs 253 LIKE operations.
+### 1.2 Optimize String Concatenation Strategy
+**Impact: MEDIUM** | **Effort: Low** | **Estimated Performance Gain: 15-25%**
 
-**Current Approach:**
+**Issue**: Concatenating all ITC fields with separators for pattern matching is inefficient.
+
+**Current Approach**:
 ```sql
 '|~|' || COALESCE(item_tracking_code_payment_attempt_list, '') || '|~|' ||
 COALESCE(item_tracking_code_begin_checkout_list, '') || '|~|' ||
 -- ... more concatenations
 ```
 
-**Recommended Approach:**
-Use ARRAY operations instead of string concatenation:
+**Recommended Solutions**:
+
+**Option A**: Use UNION ALL to normalize ITC fields first:
 ```sql
-ARRAY_CAT(
-    ARRAY_CAT(
-        SPLIT_TO_ARRAY(NULLIF(item_tracking_code_payment_attempt_list, ''), ','),
-        SPLIT_TO_ARRAY(NULLIF(item_tracking_code_begin_checkout_list, ''), ',')
-    ),
-    -- ... other arrays
-) as itc_array
-```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Reduces memory allocation and string operations  
-**Trade-offs:** Requires different matching logic
-
----
-
-### 1.3 Optimize CTE Materialization Strategy
-**Issue:** Multiple CTEs are chained without consideration for materialization. Large intermediate result sets may be recomputed.
-
-**Recommended Approach:**
-```sql
--- Add explicit temp tables for large intermediate results
-CREATE TEMP TABLE temp_base_traffic AS
-SELECT /*+ materialize */ * FROM base_traffic_data;
-
-ANALYZE temp_base_traffic;
-
--- Or use query hints if supported
-WITH base_traffic_data AS MATERIALIZED (
-    -- ... query
+session_itc_normalized AS (
+    SELECT session_id, website_activity_mst_date, 
+           SPLIT_PART(item_tracking_code_payment_attempt_list, ',', numbers.n) as itc,
+           'payment_attempt' as source
+    FROM base_traffic_data
+    CROSS JOIN (SELECT ROW_NUMBER() OVER() as n FROM large_table LIMIT 100) numbers
+    WHERE SPLIT_PART(item_tracking_code_payment_attempt_list, ',', numbers.n) != ''
+    
+    UNION ALL
+    
+    SELECT session_id, website_activity_mst_date,
+           SPLIT_PART(item_tracking_code_begin_checkout_list, ',', numbers.n),
+           'begin_checkout'
+    FROM base_traffic_data
+    -- ... repeat for other ITC fields
 )
 ```
 
-**Impact:** ðŸŸ¡ **MEDIUM** - Can reduce redundant computation  
-**Trade-offs:** May increase temp space usage
+**Option B**: If Redshift version supports it, use array functions to flatten lists, then join directly against tracking_code_rankings.
 
 ---
 
-### 1.4 Partition Strategy Enhancement
-**Issue:** No DISTKEY specified; queries filtering by date may not be optimally distributed.
+### 1.3 Eliminate Redundant Window Functions
+**Impact: MEDIUM** | **Effort: Low** | **Estimated Performance Gain: 10-15%**
 
-**Recommended Approach:**
+**Issue**: Multiple ROW_NUMBER() calculations on the same partition.
+
+**Current Code**:
 ```sql
-CREATE TABLE dev.ba_corporate.wam_site_performance
-DISTSTYLE KEY
-DISTKEY (channel_grouping_name)  -- Most common filter after date
-SORTKEY (website_date, channel_grouping_name)
-COMPOUND SORTKEY (website_date, channel_grouping_name, device_category_name)
+-- In base_product_data:
+CASE WHEN ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY item_tracking_code) = 1 
+     THEN 1 ELSE 0 END as wam_sessions
+
+-- In base_data:
+CASE WHEN ROW_NUMBER() OVER (PARTITION BY a.session_id, a.website_activity_mst_date 
+                             ORDER BY b.item_tracking_code NULLS LAST) = 1 
+     THEN 1 ELSE 0 END as traffic_row_flag
 ```
 
-**Impact:** ðŸŸ¡ **MEDIUM** - Improves query performance for common filter patterns  
-**Trade-offs:** Must align with query patterns; may impact load performance
+**Recommended**:
+```sql
+-- Calculate once and reuse:
+WITH session_product_ranking AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY item_tracking_code) as product_rank,
+        ROW_NUMBER() OVER (PARTITION BY session_id, website_activity_mst_date 
+                          ORDER BY item_tracking_code NULLS LAST) as traffic_rank
+    FROM base_product_data_raw
+),
+base_product_data AS (
+    SELECT *, 
+        CASE WHEN product_rank = 1 THEN 1 ELSE 0 END as wam_sessions,
+        CASE WHEN traffic_rank = 1 THEN 1 ELSE 0 END as traffic_row_flag
+    FROM session_product_ranking
+)
+```
 
 ---
 
-### 1.5 Pre-filter Before String Operations
-**Issue:** String concatenation and pattern matching occur on all rows before filtering.
+### 1.4 Add Distribution Key for Better Join Performance
+**Impact: MEDIUM** | **Effort: Low**
 
-**Recommended Approach:**
+**Issue**: No DISTKEY specified for the table creation. This can cause data shuffling during joins.
+
+**Recommended**:
 ```sql
--- Move filters earlier in the pipeline
-WITH base_traffic_data AS (
-    SELECT
-        session_id,
-        website_activity_mst_date,
-        -- ... fields
+CREATE TABLE dev.ba_corporate.wam_site_performance
+DISTKEY(website_date)  -- or consider DISTSTYLE ALL for small dimension tables
+SORTKEY(website_date)
+AS (...)
+```
+
+**Alternative**: If joining frequently on `top_ranked_tracking_code`, consider:
+```sql
+DISTKEY(top_ranked_tracking_code)
+COMPOUND SORTKEY(website_date, top_ranked_tracking_code)
+```
+
+---
+
+### 1.5 Push Down Filters Earlier in CTEs
+**Impact: MEDIUM** | **Effort: Low** | **Estimated Performance Gain: 10-20%**
+
+**Issue**: Filters and joins happen later than necessary, processing more data than needed.
+
+**Recommended Changes**:
+
+```sql
+-- Add session_id IS NOT NULL filter earlier:
+base_traffic_data AS (
+    SELECT ...
     FROM dev.website_prod.analytic_traffic_detail
     WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
         AND gd_sales_flag = TRUE
-        AND session_id IS NOT NULL
+        AND session_id IS NOT NULL  -- Already there - good!
         AND website_activity_exclusion_reason_desc IS NULL
-        AND channel_grouping_name IN ('Organic Search', 'Direct', 'Paid Search')  -- If applicable
-        -- Add more filters here before expensive operations
+        AND (
+            order_item_tracking_code_list IS NOT NULL OR
+            item_tracking_code_payment_attempt_list IS NOT NULL OR
+            item_tracking_code_begin_checkout_list IS NOT NULL OR
+            item_tracking_code_add_to_cart_list IS NOT NULL OR
+            item_tracking_code_click_list IS NOT NULL OR
+            item_tracking_code_impression_list IS NOT NULL
+        )  -- ADD: Skip sessions with no ITCs at all
 )
 ```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Reduces rows processed in expensive operations  
-**Trade-offs:** None if filters are logically equivalent
 
 ---
 
-### 1.6 Optimize ROW_NUMBER() Usage
-**Issue:** `ROW_NUMBER()` in `traffic_row_flag` is computed on every row, even those that won't be used.
+### 1.6 Consider Materialized CTEs for Large Intermediate Results
+**Impact: LOW-MEDIUM** | **Effort: Medium**
 
-**Recommended Approach:**
+**Issue**: Complex CTEs are re-evaluated if referenced multiple times.
+
+**Recommended**: For very large result sets, consider breaking into temp tables:
 ```sql
--- Apply row numbering only where needed, after initial aggregation
-WITH pre_aggregated AS (
-    SELECT 
-        session_id,
-        website_activity_mst_date,
-        MIN(item_tracking_code) as first_item_tracking_code,
-        -- ... other aggregations
-    FROM base_data
-    GROUP BY session_id, website_activity_mst_date
-)
+CREATE TEMP TABLE temp_base_traffic AS
+SELECT * FROM base_traffic_data;
+
+CREATE TEMP TABLE temp_base_product AS
+SELECT * FROM base_product_data;
+
+ANALYZE temp_base_traffic;
+ANALYZE temp_base_product;
 ```
 
-**Impact:** ðŸŸ¢ **LOW** - Marginal improvement  
-**Trade-offs:** May change result granularity
+**Trade-off**: Adds I/O overhead but can improve complex multi-pass queries.
 
 ---
 
 ## 2. Code Quality
 
-### 2.1 Remove Commented Code
-**Issue:** Multiple commented-out lines reduce readability.
+### 2.1 Remove Hardcoded Date Ranges
+**Impact: HIGH** | **Maintainability: Critical**
 
-**Lines to Remove:**
+**Issue**: Date range `'2026-01-01' AND '2026-01-31'` appears in two places.
+
+**Recommended**:
 ```sql
--- Line 18: -- create or replace view dna_sandbox.wam_site_marketing_v1
--- Line 33: -- '|~|' || COALESCE(order_item_tracking_code_list, '') || '|~|' ||
--- Line 39: -- '|~|' || COALESCE(order_item_tracking_code_list, '') || '|~|' AS order_itc_search,
--- Line 75: -- AND gcr_usd_amt >0
--- Line 292: Final comment with test query
-```
+-- Option 1: Use session variables (if supported):
+SET query_start_date = '2026-01-01';
+SET query_end_date = '2026-01-31';
 
-**Impact:** ðŸŸ¢ **LOW** - Improves readability  
-**Trade-offs:** None
+-- Option 2: Define at top of query:
+WITH date_params AS (
+    SELECT 
+        '2026-01-01'::DATE as start_date,
+        '2026-01-31'::DATE as end_date
+),
+base_traffic_data AS (
+    SELECT ...
+    FROM dev.website_prod.analytic_traffic_detail, date_params
+    WHERE website_activity_mst_date BETWEEN date_params.start_date AND date_params.end_date
+    ...
+)
+```
 
 ---
 
-### 2.2 Extract Magic Values to Constants
-**Issue:** The separator `'|~|'` is repeated throughout without explanation.
+### 2.2 Extract Plan Type Mapping to Lookup Table
+**Impact: MEDIUM** | **Maintainability: High**
 
-**Recommended Approach:**
+**Issue**: Plan type CASE statement is hardcoded business logic.
+
+**Current**:
 ```sql
--- At the top of the query, document constants
--- Separator pattern for ITC concatenation: '|~|'
--- This pattern was chosen to avoid conflicts with common ITC characters
-
--- Or use variables if your SQL dialect supports it
-SET @ITC_SEPARATOR = '|~|';
+CASE WHEN lower(product_pnl_subline_name) IN ('gocentral seo', 'gocentral marketing') THEN 'Marketing'
+     WHEN lower(product_pnl_subline_name) IN ('commerce plus') THEN 'Commerce Plus'
+     -- ... more mappings
+     ELSE product_pnl_subline_name END plan_type
 ```
 
-**Impact:** ðŸŸ¢ **LOW** - Improves maintainability  
-**Trade-offs:** None
+**Recommended**:
+```sql
+-- Create lookup table:
+CREATE TABLE dev.ba_corporate.product_plan_type_mapping (
+    product_pnl_subline_name VARCHAR(200),
+    plan_type VARCHAR(100),
+    is_active BOOLEAN DEFAULT TRUE
+);
+
+-- Use LEFT JOIN instead of CASE:
+LEFT JOIN dev.ba_corporate.product_plan_type_mapping ptm
+    ON LOWER(product_pnl_subline_name) = LOWER(ptm.product_pnl_subline_name)
+    AND ptm.is_active = TRUE
+-- Then: COALESCE(ptm.plan_type, product_pnl_subline_name) as plan_type
+```
 
 ---
 
-### 2.3 Standardize NULL Handling
-**Issue:** Inconsistent NULL handling - some places use `COALESCE`, others rely on `NULLIF`, others use `IS NULL`.
+### 2.3 Remove Commented-Out Code
+**Impact: LOW** | **Maintainability: Medium**
 
-**Recommended Approach:**
+**Issue**: Multiple commented lines clutter the query.
+
 ```sql
--- Establish a consistent pattern:
--- 1. Use COALESCE for dimension fields in final output
--- 2. Use NULLIF for empty string to NULL conversion
--- 3. Use IS NULL for filtering in WHERE clauses
-
--- Document the strategy in comments
--- NULL Handling Strategy:
--- - Dimension fields: COALESCE to 'Unknown' in final output only
--- - Fact fields: Keep as NULL for proper aggregation
--- - String fields: Use NULLIF to convert '' to NULL before COALESCE
+-- Remove these:
+-- '|~|' || COALESCE(order_item_tracking_code_list, '') || '|~|' ||
+-- '|~|' || COALESCE(order_item_tracking_code_list, '') || '|~|' AS order_itc_search,
+-- AND gcr_usd_amt >0
+-- create or replace view dna_sandbox.wam_site_marketing_v1
+-- select * from dna_sandbox.wam_site_marketing_v1 where top_ranked_tracking_code <> 'Not attributed'
 ```
 
-**Impact:** ðŸŸ¡ **MEDIUM** - Reduces confusion and potential bugs  
-**Trade-offs:** May require query refactoring
+**Recommendation**: Remove all commented code or move to separate documentation if needed for reference.
 
 ---
 
-### 2.4 Improve Naming Conventions
-**Issue:** Inconsistent naming (snake_case mixed with abbreviations).
+### 2.4 Improve Column Naming Consistency
+**Impact: LOW** | **Maintainability: Medium**
 
-**Examples:**
-- `gcr_session_cnt` vs `page_advance_session_cnt` (why abbreviate one?)
-- `pa_sessions` (unclear abbreviation)
-- `wam_sessions` vs `total_wam_units` (inconsistent prefixing)
+**Issues**:
+- Mixing of `cnt` suffix vs explicit names (`session_cnt` vs `sessions`)
+- `WAM_gcr` uses uppercase in CTE but lowercase in final output
+- `traffic_row_flag` is technical, not business-friendly
 
-**Recommended Approach:**
+**Recommended Naming Convention**:
 ```sql
--- Standardize to full words for clarity
-new_gcr_session_count  -- instead of new_gcr_session_cnt
-page_advance_session_count
-wam_session_count
-wam_unit_count_total
+-- Be consistent:
+session_count (not session_cnt)
+gcr_session_count (not gcr_session_cnt)
+wam_gross_customer_revenue (not WAM_gcr)
+is_primary_traffic_row (not traffic_row_flag)
 ```
-
-**Impact:** ðŸŸ¢ **LOW** - Improves clarity for future developers  
-**Trade-offs:** Breaking change if views/queries depend on current names
 
 ---
 
-### 2.5 Add Comprehensive Comments
-**Issue:** Complex business logic lacks explanation.
+### 2.5 Add Query Header Documentation
+**Impact: LOW** | **Maintainability: High**
 
-**Recommended Additions:**
+**Current**: Minimal documentation at top.
+
+**Recommended**:
 ```sql
--- TRAFFIC_ROW_FLAG LOGIC:
--- Purpose: Prevents double-counting traffic metrics when a session purchases multiple products
--- Method: Assigns flag=1 to only the first product per session (ordered by item_tracking_code)
--- Impact: session_cnt, pa_session_cnt, gcr_session_cnt are multiplied by this flag
--- Example: Session with 3 products -> only first product gets traffic credit
-
--- TRACKING CODE RANKING STRATEGY:
--- Priority order:
---   1. order_item_tracking_code (actual purchase ITC) - highest priority
---   2. Ranked ITCs from funnel fields (payment_attempt -> checkout -> cart -> click -> impression)
---   3. 'Not attributed' if no match found
--- Ranking based on historical GCR (Ranks 1-95) then unit quantity (Ranks 96-253)
+--------------------------------------------------------------------------------
+-- TABLE: dev.ba_corporate.wam_site_performance
+-- PURPOSE: Track WAM (Websites & Marketing) site performance with attribution
+-- JIRA: HAT-3917
+-- OWNER: [Team/Person]
+-- REFRESH: [Daily/Weekly/Monthly]
+-- DEPENDENCIES:
+--   - dev.website_prod.analytic_traffic_detail
+--   - dev.dna_approved.bill_line_traffic_ext
+--   - dev.ba_corporate.wam_itc_site
+--   - dev.ba_corporate.tracking_code_rankings (if implemented)
+-- NOTES:
+--   - Uses top-ranked tracking code attribution logic
+--   - Deduplicates sessions to prevent double-counting
+--   - Date range MUST be updated before each run
+-- LAST MODIFIED: 2026-03-09
+-- CHANGELOG:
+--   2026-03-09: Initial creation
+--------------------------------------------------------------------------------
 ```
 
-**Impact:** ðŸŸ¡ **MEDIUM** - Critical for maintainability  
-**Trade-offs:** None
+---
+
+### 2.6 Standardize NULL Handling
+**Impact: MEDIUM** | **Data Quality: Medium**
+
+**Issue**: Inconsistent COALESCE with different default values:
+- `'Unknown'` for dimensions
+- `'N/A'` for product fields
+- `'Not attributed'` for tracking code
+
+**Recommendation**: Create a standard or at minimum document the convention:
+```sql
+-- Traffic dimensions: 'Unknown'
+-- Product dimensions: 'Not Applicable' (more explicit than 'N/A')
+-- Attribution fields: 'Not Attributed'
+-- Consider: Use NULL instead and handle in BI layer for flexibility
+```
 
 ---
 
 ## 3. Maintainability
 
-### 3.1 Parameterize Date Ranges
-**Issue:** Hardcoded dates appear in multiple locations.
+### 3.1 Externalize Business Logic to Config Tables
+**Impact: HIGH** | **Effort: Medium**
 
-**Current Approach:**
+**Issues to Externalize**:
+1. Tracking code rankings (addressed in 1.1)
+2. Plan type mappings (addressed in 2.2)
+3. Product line filters
+4. Channel grouping definitions (if any transformations exist)
+
+**Additional Recommendations**:
 ```sql
-WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
-```
-
-**Recommended Approach:**
-```sql
--- Option 1: Use session variables (Redshift)
--- At query start:
--- SET query_start_date = '2026-01-01';
--- SET query_end_date = '2026-01-31';
-
--- Option 2: Create a date dimension table
-WITH date_params AS (
-    SELECT 
-        DATE_TRUNC('month', CURRENT_DATE - INTERVAL '1 month') as start_date,
-        DATE_TRUNC('month', CURRENT_DATE) - INTERVAL '1 day' as end_date
-)
-SELECT * FROM base_traffic_data, date_params
-WHERE website_activity_mst_date BETWEEN date_params.start_date AND date_params.end_date
-```
-
-**Impact:** ðŸ”´ **HIGH** - Enables automation and reduces errors  
-**Trade-offs:** Requires additional setup for dynamic date logic
-
----
-
-### 3.2 Externalize Tracking Code Mapping
-**Issue:** The 253 tracking codes are embedded in query logic.
-
-**Recommended Approach:**
-```sql
--- Create a configuration table
-CREATE TABLE dev.ba_corporate.tracking_code_config (
-    tracking_code VARCHAR(200),
-    rank_order INT,
-    gcr_amount DECIMAL(15,2),
-    unit_qty INT,
-    gcr_tier VARCHAR(20), -- 'Revenue Generating' or 'Zero Revenue'
-    created_date TIMESTAMP DEFAULT GETDATE(),
-    updated_date TIMESTAMP DEFAULT GETDATE(),
+-- Create configuration table for reusable filters:
+CREATE TABLE dev.ba_corporate.wam_config (
+    config_key VARCHAR(100),
+    config_value VARCHAR(500),
+    config_type VARCHAR(50),
     is_active BOOLEAN DEFAULT TRUE
 );
 
--- Populate from CSV
-COPY dev.ba_corporate.tracking_code_config
-FROM 's3://bucket/tracking_codes.csv'
-IAM_ROLE 'arn:aws:iam::xxxx'
-CSV DELIMITER ',' IGNOREHEADER 1;
-
--- Use in query
-LEFT JOIN dev.ba_corporate.tracking_code_config tc 
-    ON tc.tracking_code = <extracted_code>
-    AND tc.is_active = TRUE
+INSERT INTO dev.ba_corporate.wam_config VALUES
+('product_pnl_line', 'Websites and Marketing', 'product_filter', TRUE),
+('product_pnl_line', 'Website Builder', 'product_filter', TRUE),
+('point_of_purchase', 'Web', 'purchase_filter', TRUE);
 ```
-
-**Impact:** ðŸ”´ **HIGH** - Enables non-developer updates to tracking codes  
-**Trade-offs:** Requires change management process for config table
 
 ---
 
-### 3.3 Modularize Product Classification Logic
-**Issue:** Product type mapping logic is embedded in CTE.
+### 3.2 Break Into Modular Sub-Queries
+**Impact: MEDIUM** | **Effort: Medium**
 
-**Current Approach:**
+**Issue**: Single 500+ line query is difficult to test, debug, and modify.
+
+**Recommended Approach**: Break into incremental tables/views:
 ```sql
-CASE WHEN lower(product_pnl_subline_name) IN ('gocentral seo', 'gocentral marketing') then 'Marketing'
-     WHEN lower(product_pnl_subline_name) IN ('commerce plus') then 'Commerce Plus'
-     -- ... more cases
-END plan_type
+-- Step 1: Base traffic (can be a view for testing)
+CREATE VIEW dev.ba_corporate.wam_base_traffic_v AS
+SELECT ... FROM base_traffic_data;
+
+-- Step 2: Base product
+CREATE VIEW dev.ba_corporate.wam_base_product_v AS
+SELECT ... FROM base_product_data;
+
+-- Step 3: Attribution logic
+CREATE VIEW dev.ba_corporate.wam_attribution_v AS
+SELECT ... FROM final_attribution;
+
+-- Step 4: Final aggregation
+CREATE TABLE dev.ba_corporate.wam_site_performance AS
+SELECT ... FROM wam_attribution_v;
 ```
 
-**Recommended Approach:**
-```sql
--- Create dimension table
-CREATE TABLE dev.ba_corporate.product_type_mapping (
-    product_pnl_subline_name_lower VARCHAR(100),
-    plan_type VARCHAR(50),
-    effective_date DATE,
-    expiration_date DATE
-);
-
--- Use in query
-LEFT JOIN dev.ba_corporate.product_type_mapping ptm
-    ON LOWER(product_pnl_subline_name) = ptm.product_pnl_subline_name_lower
-    AND website_activity_mst_date BETWEEN ptm.effective_date AND ptm.expiration_date
-```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Enables product catalog changes without code deployment  
-**Trade-offs:** Additional join complexity
+**Benefits**:
+- Each step can be tested independently
+- Easier to identify performance bottlenecks
+- Can reuse intermediate views for other analyses
+- Simplifies debugging
 
 ---
 
-### 3.4 Create View for Source Field Logic
-**Issue:** The source field determination logic is repeated conceptually.
+### 3.3 Add Data Quality Checks
+**Impact: MEDIUM** | **Effort: Low**
 
-**Recommended Approach:**
+**Recommended**: Add validation CTEs before final output:
+
 ```sql
--- Create a separate function or view for this logic
-CREATE OR REPLACE VIEW source_attribution_v AS
-SELECT 
-    session_id,
-    website_activity_mst_date,
-    CASE
-        WHEN order_item_tracking_code IS NOT NULL THEN 'order_itc'
-        WHEN payment_attempt_search LIKE '%' || tracking_code || '%' THEN 'payment_attempt'
-        WHEN begin_checkout_search LIKE '%' || tracking_code || '%' THEN 'begin_checkout'
-        WHEN add_to_cart_search LIKE '%' || tracking_code || '%' THEN 'add_to_cart'
-        WHEN click_search LIKE '%' || tracking_code || '%' THEN 'click'
-        WHEN impression_search LIKE '%' || tracking_code || '%' THEN 'impression'
-        ELSE NULL
-    END as source_field
-FROM ...
+data_quality_checks AS (
+    SELECT
+        COUNT(*) as total_rows,
+        COUNT(DISTINCT session_id) as unique_sessions,
+        SUM(CASE WHEN website_date IS NULL THEN 1 ELSE 0 END) as null_dates,
+        SUM(CASE WHEN session_cnt < 0 THEN 1 ELSE 0 END) as negative_sessions,
+        SUM(CASE WHEN GCR < 0 THEN 1 ELSE 0 END) as negative_gcr,
+        SUM(CASE WHEN sessions != session_cnt THEN 1 ELSE 0 END) as session_mismatch
+    FROM final_output
+),
+validation AS (
+    SELECT
+        CASE 
+            WHEN null_dates > 0 THEN 'FAIL: Null dates found'
+            WHEN negative_sessions > 0 THEN 'FAIL: Negative session counts'
+            WHEN negative_gcr > 0 THEN 'FAIL: Negative GCR values'
+            ELSE 'PASS'
+        END as validation_status
+    FROM data_quality_checks
+)
+-- Log or raise error if validation fails
 ```
-
-**Impact:** ðŸŸ¢ **LOW** - Improves reusability  
-**Trade-offs:** Additional database object to maintain
 
 ---
 
-### 3.5 Version Control for Query Logic
-**Issue:** No indication of query version or change history beyond JIRA reference.
+### 3.4 Separate Delimiter from Column Values
+**Impact: LOW** | **Effort: Low**
 
-**Recommended Approach:**
+**Issue**: The `|~|` delimiter is hardcoded throughout the query.
+
+**Recommended**:
 ```sql
--- Add metadata at top of query
-/*
- * Query: WAM Site Performance Tracking
- * Version: 2.0.0
- * Last Modified: 2026-01-15
- * Author: Analytics Team
- * JIRA: HAT-3917 (Timeout issue)
- * 
- * Change Log:
- * - 2.0.0 (2026-01-15): Refactored ITC matching to use lookup table (HAT-3917)
- * - 1.5.0 (2025-12-10): Added traffic_row_flag to prevent double-counting
- * - 1.0.0 (2025-11-01): Initial implementation
- */
+-- Define once at the top:
+WITH constants AS (
+    SELECT 
+        '|~|' as itc_delimiter,
+        '2026-01-01'::DATE as start_date,
+        '2026-01-31'::DATE as end_date
+),
+base_traffic_data AS (
+    SELECT
+        ...,
+        constants.itc_delimiter || COALESCE(item_tracking_code_payment_attempt_list, '') || 
+        constants.itc_delimiter || ... AS all_itc_combined
+    FROM dev.website_prod.analytic_traffic_detail, constants
+    ...
+)
 ```
-
-**Impact:** ðŸŸ¢ **LOW** - Improves change tracking  
-**Trade-offs:** None
 
 ---
 
 ## 4. Data Quality
 
-### 4.1 Add Data Validation Checks
-**Issue:** No validation that traffic and product data are joining correctly.
+### 4.1 Validate Date Range Boundaries
+**Impact: MEDIUM** | **Effort: Low**
 
-**Recommended Approach:**
+**Issue**: No validation that date ranges align between traffic and product data.
+
+**Recommended**:
 ```sql
--- Add quality checks as separate queries or CTEs
-WITH data_quality_checks AS (
+-- Add assertion CTE:
+date_alignment_check AS (
     SELECT
-        'Unmatched sessions' as check_name,
-        COUNT(*) as issue_count
-    FROM base_traffic_data a
-    LEFT JOIN base_product_data b USING (session_id, website_activity_mst_date)
-    WHERE a.session_id IS NOT NULL AND b.session_id IS NULL
-    
-    UNION ALL
-    
+        MIN(t.website_activity_mst_date) as traffic_min_date,
+        MAX(t.website_activity_mst_date) as traffic_max_date,
+        MIN(p.website_activity_mst_date) as product_min_date,
+        MAX(p.website_activity_mst_date) as product_max_date
+    FROM base_traffic_data t
+    FULL OUTER JOIN base_product_data p ON 1=1
+),
+date_validation AS (
     SELECT
-        'Orphan product records' as check_name,
-        COUNT(*) as issue_count
-    FROM base_product_data a
-    LEFT JOIN base_traffic_data b USING (session_id, website_activity_mst_date)
-    WHERE a.session_id IS NOT NULL AND b.session_id IS NULL
-    
-    UNION ALL
-    
-    SELECT
-        'Sessions with NULL tracking codes after extraction' as check_name,
-        COUNT(*) as issue_count
-    FROM top_ranked_extract
-    WHERE top_ranked_tracking_code IS NULL AND order_item_tracking_code IS NULL
+        CASE 
+            WHEN traffic_min_date != product_min_date 
+                OR traffic_max_date != product_max_date 
+            THEN 'WARNING: Date ranges do not align'
+            ELSE 'OK'
+        END as date_check_status
+    FROM date_alignment_check
 )
-SELECT * FROM data_quality_checks WHERE issue_count > 0;
 ```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Enables data quality monitoring  
-**Trade-offs:** Adds query complexity
 
 ---
 
-### 4.2 Handle Edge Case: Multiple Products per Session
-**Issue:** The `traffic_row_flag` logic may not handle all edge cases correctly.
+### 4.2 Add Session Deduplication Validation
+**Impact: HIGH** | **Effort: Low**
 
-**Potential Issue:**
+**Issue**: The `traffic_row_flag` prevents double-counting, but there's no validation that it works correctly.
+
+**Recommended**:
 ```sql
--- What if two products have the same item_tracking_code in one session?
--- Current logic: ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY item_tracking_code)
--- This might arbitrarily pick one
-```
-
-**Recommended Approach:**
-```sql
--- Make the ordering deterministic and documented
-CASE WHEN ROW_NUMBER() OVER (
-    PARTITION BY session_id, website_activity_mst_date 
-    ORDER BY 
-        item_tracking_code,
-        CASE WHEN free_or_paid = 'Paid' THEN 1
-             WHEN free_or_paid = 'Free to Paid' THEN 2
-             WHEN free_or_paid = 'Free' THEN 3
-        END,
-        gcr DESC,  -- Highest revenue first
-        product_term  -- Tie-breaker
-) = 1 THEN 1 ELSE 0 END as traffic_row_flag
-```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Ensures consistent attribution  
-**Trade-offs:** More complex logic
-
----
-
-### 4.3 Validate ITC Separator Pattern
-**Issue:** If tracking codes contain the separator pattern `|~|`, matching will fail.
-
-**Recommended Approach:**
-```sql
--- Add validation check
-WITH invalid_itcs AS (
-    SELECT DISTINCT item_tracking_code
-    FROM dev.ba_corporate.tracking_code_config
-    WHERE item_tracking_code LIKE '%|~|%'
+-- Add validation CTE:
+session_count_validation AS (
+    SELECT 
+        session_id,
+        website_activity_mst_date,
+        COUNT(*) as row_count,
+        SUM(traffic_row_flag) as flag_sum
+    FROM base_data
+    GROUP BY 1, 2
+    HAVING COUNT(*) > 1 AND SUM(traffic_row_flag) != 1
 )
-SELECT 
-    CASE WHEN COUNT(*) > 0 
-         THEN 'ERROR: Tracking codes contain reserved separator pattern'
-         ELSE 'OK'
-    END as validation_status
-FROM invalid_itcs;
+-- If this returns rows, deduplication logic is broken
 ```
-
-**Impact:** ðŸŸ¢ **LOW** - Prevents silent matching failures  
-**Trade-offs:** None
 
 ---
 
-### 4.4 Add Constraints for Referential Integrity
-**Issue:** No explicit foreign key relationships or constraints.
+### 4.3 Handle Edge Case: Zero GCR vs NULL GCR
+**Impact: MEDIUM** | **Effort: Low**
 
-**Recommended Approach:**
-```sql
--- Add NOT NULL constraints
-ALTER TABLE dev.ba_corporate.wam_site_performance
-ALTER COLUMN website_date SET NOT NULL;
+**Issue**: The `free_or_paid` logic uses `COALESCE(gcr_usd_amt, 0) = 0` which treats NULL as Free.
 
--- Add check constraints
-ALTER TABLE dev.ba_corporate.wam_site_performance
-ADD CONSTRAINT chk_sessions_positive CHECK (sessions >= 0);
-
-ALTER TABLE dev.ba_corporate.wam_site_performance
-ADD CONSTRAINT chk_gcr_positive CHECK (gcr >= 0);
-
--- Document expected cardinality
--- Expected: 1 session should match 0 or 1 product records (may have multiple products)
-```
-
-**Impact:** ðŸŸ¢ **LOW** - Catches data issues early  
-**Trade-offs:** May impact load performance slightly
-
----
-
-### 4.5 Handle Free/Paid Classification Edge Cases
-**Issue:** The free_or_paid logic doesn't handle NULL gcr_usd_amt explicitly.
-
-**Current Logic:**
-```sql
-CASE 
-    WHEN COALESCE(gcr_usd_amt, 0) = 0 THEN 'Free'
-    WHEN gcr_usd_amt > 0 and product_free_trial_conversion_flag = 'True' THEN 'Free to Paid'
-    WHEN gcr_usd_amt > 0 and product_free_trial_conversion_flag = 'False' THEN 'Paid'
-END as free_or_paid
-```
-
-**Issue:** What if `product_free_trial_conversion_flag` is NULL?
-
-**Recommended Approach:**
+**Current**:
 ```sql
 CASE 
     WHEN COALESCE(gcr_usd_amt, 0) = 0 THEN 'Free'
     WHEN gcr_usd_amt > 0 AND product_free_trial_conversion_flag = 'True' THEN 'Free to Paid'
-    WHEN gcr_usd_amt > 0 AND COALESCE(product_free_trial_conversion_flag, 'False') = 'False' THEN 'Paid'
-    ELSE 'Unknown'  -- Catch unexpected states
+    WHEN gcr_usd_amt > 0 AND product_free_trial_conversion_flag = 'False' THEN 'Paid'
 END as free_or_paid
 ```
 
-**Impact:** ðŸŸ¢ **LOW** - Handles edge cases explicitly  
-**Trade-offs:** None
+**Issue**: What if `gcr_usd_amt` is NULL (no revenue data)? Is that the same as "Free" (0 revenue)?
+
+**Recommended**:
+```sql
+CASE 
+    WHEN gcr_usd_amt IS NULL THEN 'Unknown Revenue'
+    WHEN gcr_usd_amt = 0 THEN 'Free'
+    WHEN gcr_usd_amt > 0 AND product_free_trial_conversion_flag = 'True' THEN 'Free to Paid'
+    WHEN gcr_usd_amt > 0 AND product_free_trial_conversion_flag = 'False' THEN 'Paid'
+    ELSE 'Other'
+END as free_or_paid
+```
+
+---
+
+### 4.4 Validate Product Filter Consistency
+**Impact: MEDIUM** | **Effort: Low**
+
+**Issue**: Product line filter uses `IN ('Websites and Marketing', 'Website Builder')` - could miss variations in capitalization or spacing.
+
+**Recommended**:
+```sql
+-- Make filter case-insensitive and trim whitespace:
+WHERE LOWER(TRIM(product_pnl_line_name)) IN ('websites and marketing', 'website builder')
+```
+
+---
+
+### 4.5 Add Referential Integrity Checks
+**Impact: MEDIUM** | **Effort: Low**
+
+**Issue**: No validation that joined data actually matches.
+
+**Recommended**:
+```sql
+-- Add to validation suite:
+orphaned_traffic AS (
+    SELECT COUNT(*) as orphan_count
+    FROM base_traffic_data t
+    LEFT JOIN base_product_data p 
+        ON t.session_id = p.session_id 
+        AND t.website_activity_mst_date = p.website_activity_mst_date
+    WHERE t.gcr_session_cnt > 0  -- Should have product data
+        AND p.session_id IS NULL
+),
+orphaned_products AS (
+    SELECT COUNT(*) as orphan_count
+    FROM base_product_data p
+    LEFT JOIN base_traffic_data t
+        ON p.session_id = t.session_id 
+        AND p.website_activity_mst_date = t.website_activity_mst_date
+    WHERE t.session_id IS NULL
+)
+```
+
+---
+
+### 4.6 Validate String Parsing Assumptions
+**Impact: MEDIUM** | **Effort: Low**
+
+**Issue**: The query assumes ITC lists are properly delimited and don't contain the delimiter string `|~|` within values.
+
+**Recommended Testing**:
+```sql
+-- Check for delimiter in raw values:
+SELECT 
+    session_id,
+    item_tracking_code_payment_attempt_list
+FROM dev.website_prod.analytic_traffic_detail
+WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
+    AND item_tracking_code_payment_attempt_list LIKE '%|~|%'
+LIMIT 100;
+
+-- If found, need to escape or use different delimiter
+```
 
 ---
 
 ## 5. Scalability Concerns
 
-### 5.1 Address Timeout Risk (JIRA HAT-3917)
-**Issue:** Query currently times out due to expensive string operations.
+### 5.1 Partitioning Strategy for Long-Term Growth
+**Impact: HIGH** | **Effort: High**
 
-**Root Causes:**
-1. 253 sequential LIKE operations on concatenated strings
-2. String concatenation on every row before filtering
-3. No indexes on string fields (inherently)
+**Issue**: Table will grow continuously with daily/monthly data. Current structure has SORTKEY but no partitioning.
 
-**Recommended Solution (Priority Order):**
-1. âœ… Replace CASE/LIKE with lookup table join (Section 1.1) - **Critical**
-2. âœ… Split ITC strings to arrays and use ANY/ALL operators (Section 1.2)
-3. âœ… Add more aggressive filtering before string operations (Section 1.5)
-
-**Impact:** ðŸ”´ **HIGH** - Directly addresses the timeout issue  
-**Trade-offs:** Requires schema changes and data migration
-
----
-
-### 5.2 Handle Data Volume Growth
-**Issue:** As tracking codes and date ranges grow, performance will degrade.
-
-**Current State:**
-- Processes 1 month of data
-- 253 tracking codes to match
-- Unknown session volume (estimate: millions?)
-
-**Recommended Approach:**
+**Recommended**:
 ```sql
--- Option 1: Incremental processing
--- Process daily and aggregate to monthly
-CREATE TABLE dev.ba_corporate.wam_site_performance_daily (
-    website_date DATE NOT NULL,
-    -- ... same schema
-) 
-PARTITION BY (website_date)
-SORTKEY (website_date);
-
--- Then aggregate to monthly view
-CREATE VIEW dev.ba_corporate.wam_site_performance_monthly AS
-SELECT 
-    DATE_TRUNC('month', website_date) as month,
-    channel_grouping_name,
-    -- ... other dimensions
-    SUM(sessions) as sessions,
-    SUM(gcr) as gcr
-FROM dev.ba_corporate.wam_site_performance_daily
-GROUP BY 1, 2, ...;
-
--- Option 2: Add date range partitioning
-CREATE TABLE dev.ba_corporate.wam_site_performance (
-    -- ... columns
-)
-PARTITION BY RANGE (website_date);
-
-CREATE TABLE wam_site_performance_2026_01 
-    PARTITION OF wam_site_performance
-    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-```
-
-**Impact:** ðŸ”´ **HIGH** - Enables processing of larger date ranges  
-**Trade-offs:** More complex ETL process
-
----
-
-### 5.3 Optimize for Incremental Loads
-**Issue:** Current query uses `CREATE OR REPLACE`, suggesting full refresh.
-
-**Recommended Approach:**
-```sql
--- Use MERGE/UPSERT for incremental loads
-MERGE INTO dev.ba_corporate.wam_site_performance target
-USING (
-    -- Query logic here with parameterized date range
+-- If Redshift supports date partitioning (or use separate tables per month):
+CREATE TABLE dev.ba_corporate.wam_site_performance_202601
+DISTKEY(website_date)
+SORTKEY(website_date)
+AS (
     SELECT * FROM final_output
-    WHERE website_date = '2026-01-31'  -- Today's date
-) source
-ON target.website_date = source.website_date
-   AND target.channel_grouping_name = source.channel_grouping_name
-   -- ... other key fields
-WHEN MATCHED THEN UPDATE SET
-    sessions = source.sessions,
-    gcr = source.gcr,
-    -- ... other metrics
-WHEN NOT MATCHED THEN INSERT VALUES (
-    source.*
+    WHERE website_date BETWEEN '2026-01-01' AND '2026-01-31'
 );
 
--- Delete old/corrected data first if needed
+-- Create a view union for easy querying:
+CREATE VIEW dev.ba_corporate.wam_site_performance AS
+SELECT * FROM dev.ba_corporate.wam_site_performance_202601
+UNION ALL
+SELECT * FROM dev.ba_corporate.wam_site_performance_202602
+-- ... etc
+```
+
+**Alternative**: Implement automated table rotation and archival strategy.
+
+---
+
+### 5.2 Query Timeout Risk Mitigation
+**Impact: HIGH** | **Effort: Medium**
+
+**Issue**: With 253 LIKE operations per row and growing data, query timeout is likely.
+
+**Immediate Mitigations**:
+1. Implement table-driven approach (see 1.1)
+2. Add query timeout parameter:
+```sql
+SET statement_timeout = '30min';  -- Adjust as needed
+```
+3. Consider incremental processing:
+```sql
+-- Process one day at a time and merge:
+FOR each_date IN date_range LOOP
+    INSERT INTO wam_site_performance
+    SELECT * FROM attribution_logic
+    WHERE website_date = each_date;
+END LOOP;
+```
+
+---
+
+### 5.3 Memory Usage Optimization
+**Impact: MEDIUM** | **Effort: Medium**
+
+**Issue**: Multiple CTEs with aggregations and window functions consume memory.
+
+**Recommended**:
+```sql
+-- Add WLM (Workload Management) query group for resource allocation:
+SET query_group TO 'etl_large';
+
+-- Monitor actual memory usage:
+SELECT query, label, is_diskbased, workmem, rows
+FROM svl_query_summary
+WHERE query = pg_last_query_id()
+ORDER BY workmem DESC;
+```
+
+**If disk-based**: Consider increasing memory allocation or breaking into smaller chunks.
+
+---
+
+### 5.4 Handling Tracking Code Growth
+**Impact: HIGH** | **Effort: Low** (if table-driven)
+
+**Issue**: Currently 253 tracking codes; will likely grow over time.
+
+**With Table-Driven Approach**:
+```sql
+-- Just add new row:
+INSERT INTO dev.ba_corporate.tracking_code_rankings 
+VALUES ('new_tracking_code', 254, 0, 0, TRUE, CURRENT_TIMESTAMP);
+
+-- No query changes needed!
+```
+
+**Without Table-Driven Approach**: Every new tracking code requires:
+1. Query modification
+2. Testing
+3. Redeployment
+4. Risk of introducing errors
+
+---
+
+### 5.5 Incremental Processing Strategy
+**Impact: MEDIUM** | **Effort: High**
+
+**Issue**: Full reprocessing every run is inefficient for historical data.
+
+**Recommended Approach**:
+```sql
+-- Track what's been processed:
+CREATE TABLE dev.ba_corporate.wam_processing_log (
+    process_date DATE PRIMARY KEY,
+    start_time TIMESTAMP,
+    end_time TIMESTAMP,
+    row_count BIGINT,
+    status VARCHAR(20)
+);
+
+-- Only process new/changed dates:
 DELETE FROM dev.ba_corporate.wam_site_performance
-WHERE website_date = '2026-01-31';
-```
+WHERE website_date BETWEEN @start_date AND @end_date;
 
-**Impact:** ðŸŸ¡ **MEDIUM** - Enables efficient daily refreshes  
-**Trade-offs:** More complex load logic
+INSERT INTO dev.ba_corporate.wam_site_performance
+SELECT * FROM final_output
+WHERE website_date BETWEEN @start_date AND @end_date;
+
+-- Log completion:
+INSERT INTO dev.ba_corporate.wam_processing_log VALUES
+(@process_date, @start_time, CURRENT_TIMESTAMP, @@rowcount, 'SUCCESS');
+```
 
 ---
 
-### 5.4 Consider Materialized Views for Common Aggregations
-**Issue:** If this table is frequently aggregated in the same ways, performance can be improved.
+### 5.6 Index Strategy for Final Table
+**Impact: MEDIUM** | **Effort: Low**
 
-**Recommended Approach:**
+**Issue**: SORTKEY on `website_date` is good for time-series queries, but other query patterns may suffer.
+
+**Recommended Analysis**:
 ```sql
--- Create materialized views for common aggregation patterns
-CREATE MATERIALIZED VIEW dev.ba_corporate.wam_site_performance_by_channel AS
-SELECT 
-    website_date,
-    channel_grouping_name,
-    SUM(sessions) as sessions,
-    SUM(gcr_sessions) as gcr_sessions,
-    SUM(gcr) as gcr,
-    SUM(wam_sessions) as wam_sessions
+-- Analyze common query patterns:
+-- 1. Filter by tracking code?
+-- 2. Filter by channel + device?
+-- 3. Filter by date + tracking code?
+
+-- Consider interleaved sortkey for multiple access patterns:
+CREATE TABLE dev.ba_corporate.wam_site_performance
+DISTKEY(website_date)
+INTERLEAVED SORTKEY(website_date, top_ranked_tracking_code, channel_grouping_name)
+AS (...)
+```
+
+**Trade-off**: Interleaved sortkeys are slower to maintain but better for multiple query patterns.
+
+---
+
+### 5.7 Add Monitoring and Alerting
+**Impact: MEDIUM** | **Effort: Medium**
+
+**Recommended Instrumentation**:
+```sql
+-- Add metrics table:
+CREATE TABLE dev.ba_corporate.wam_performance_metrics (
+    metric_date DATE,
+    metric_name VARCHAR(100),
+    metric_value DECIMAL(18,2),
+    execution_time_seconds INT,
+    query_id VARCHAR(100),
+    recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Log key metrics:
+INSERT INTO dev.ba_corporate.wam_performance_metrics
+SELECT
+    CURRENT_DATE as metric_date,
+    'total_sessions' as metric_name,
+    SUM(sessions) as metric_value,
+    EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - @query_start_time)) as execution_time_seconds,
+    pg_last_query_id() as query_id,
+    CURRENT_TIMESTAMP
 FROM dev.ba_corporate.wam_site_performance
-GROUP BY website_date, channel_grouping_name;
-
--- Refresh incrementally
-REFRESH MATERIALIZED VIEW dev.ba_corporate.wam_site_performance_by_channel;
+WHERE website_date = CURRENT_DATE - 1;
 ```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Speeds up common queries  
-**Trade-offs:** Additional storage and refresh overhead
-
----
-
-### 5.5 Monitor Query Resource Usage
-**Issue:** No visibility into query performance characteristics.
-
-**Recommended Approach:**
-```sql
--- Add query monitoring
--- 1. Enable query logging in Redshift
--- 2. Create monitoring dashboard with:
---    - Query runtime trends
---    - Rows processed
---    - Temp space used
---    - Node distribution
-
--- Add query label for tracking
-SET query_group TO 'wam_site_performance';
-
--- Or use query label
-/* Query: WAM Site Performance | Version: 2.0 */
-
--- Monitor via system tables
-SELECT 
-    query,
-    starttime,
-    endtime,
-    DATEDIFF(seconds, starttime, endtime) as duration_seconds,
-    rows,
-    bytes
-FROM stl_query
-WHERE querytxt LIKE '%wam_site_performance%'
-ORDER BY starttime DESC
-LIMIT 10;
-```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Enables proactive performance management  
-**Trade-offs:** Requires monitoring infrastructure
-
----
-
-### 5.6 Implement Query Result Caching Strategy
-**Issue:** If the same date ranges are queried repeatedly, computation is wasted.
-
-**Recommended Approach:**
-```sql
--- Use Redshift result caching effectively
--- 1. Query must be identical (byte-for-byte)
--- 2. Underlying data must not have changed
-
--- Enable result caching (default in Redshift)
-SET enable_result_cache_for_session TO ON;
-
--- For incremental pattern:
--- Cache daily results, then aggregate
--- This allows reuse of cached daily results
-```
-
-**Impact:** ðŸŸ¢ **LOW** - Helps with repeated queries  
-**Trade-offs:** Only works for identical queries
-
----
-
-## 6. Additional Recommendations
-
-### 6.1 Split into Multiple Tables by Granularity
-**Issue:** Current table mixes session-level and product-level dimensions.
-
-**Recommended Approach:**
-```sql
--- Fact table 1: Session-level traffic
-CREATE TABLE wam_site_performance_traffic (
-    website_date DATE,
-    session_id VARCHAR,
-    channel_grouping_name VARCHAR,
-    -- ... session attributes
-    sessions INT,
-    gcr_sessions INT
-);
-
--- Fact table 2: Product-level conversion
-CREATE TABLE wam_site_performance_products (
-    website_date DATE,
-    session_id VARCHAR,
-    product_term VARCHAR,
-    plan_type VARCHAR,
-    wam_sessions INT,
-    gcr DECIMAL
-);
-
--- Join at query time for specific analyses
-```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Improves flexibility and query performance  
-**Trade-offs:** More complex data model
-
----
-
-### 6.2 Add Unit Tests for Business Logic
-**Issue:** Complex business logic (traffic_row_flag, ranking, attribution) has no automated tests.
-
-**Recommended Approach:**
-```sql
--- Create test cases table
-CREATE TABLE dev.ba_corporate.wam_site_perf_test_cases (
-    test_name VARCHAR,
-    test_input JSON,
-    expected_output JSON
-);
-
--- Example test case
-INSERT INTO wam_site_perf_test_cases VALUES (
-    'single_session_single_product',
-    '{"session_id": "test1", "products": [{"itc": "upp_f2p_upgrade", "gcr": 100}]}',
-    '{"top_ranked_tracking_code": "upp_f2p_upgrade", "wam_sessions": 1, "traffic_row_flag": 1}'
-);
-
--- Run tests
--- (Implementation depends on testing framework)
-```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Prevents regression  
-**Trade-offs:** Requires testing infrastructure
-
----
-
-### 6.3 Document Performance Baseline
-**Issue:** No documented performance expectations.
-
-**Recommended Approach:**
-```
-Performance SLA Documentation:
-- Query execution time: < 5 minutes for 1 month of data (target: 2 minutes)
-- Data freshness: Daily refresh by 6 AM EST
-- Resource usage: < 50% cluster capacity during refresh
-- Data volume: ~10M sessions/month, ~1M products/month (Jan 2026 baseline)
-
-Monitoring alerts:
-- Alert if query time > 10 minutes
-- Alert if row count deviates > 20% from previous month
-- Alert if GCR sum deviates > 10% from bill_line_traffic_ext source
-```
-
-**Impact:** ðŸŸ¡ **MEDIUM** - Enables SLA management  
-**Trade-offs:** Requires monitoring setup
 
 ---
 
 ## Priority Implementation Roadmap
 
-### Phase 1 (Critical - Week 1):
-1. âœ… Create tracking_code_ranking table and replace CASE/LIKE logic (Section 1.1)
-2. âœ… Parameterize date ranges (Section 3.1)
-3. âœ… Remove commented code (Section 2.1)
+### Phase 1: Critical (Immediate - Week 1)
+1. **Replace CASE WHEN with table-driven lookup** (Performance: +50-80%)
+2. **Remove hardcoded dates** (Maintainability)
+3. **Add data quality validation checks** (Data Quality)
 
-**Expected Impact:** Resolve timeout issue (HAT-3917)
+### Phase 2: High Priority (Week 2-3)
+4. **Optimize string concatenation strategy** (Performance: +15-25%)
+5. **Externalize plan type mapping** (Maintainability)
+6. **Add session deduplication validation** (Data Quality)
+7. **Implement incremental processing** (Scalability)
 
-### Phase 2 (High Priority - Week 2-3):
-4. âœ… Implement incremental load strategy (Section 5.3)
-5. âœ… Add data quality checks (Section 4.1)
-6. âœ… Externalize product classification mapping (Section 3.3)
+### Phase 3: Medium Priority (Week 4-6)
+8. **Break into modular sub-queries** (Maintainability)
+9. **Eliminate redundant window functions** (Performance: +10-15%)
+10. **Add monitoring and alerting** (Operations)
+11. **Implement partitioning strategy** (Scalability)
 
-**Expected Impact:** Improve maintainability and data quality
-
-### Phase 3 (Medium Priority - Month 2):
-7. âœ… Optimize distribution and sort keys (Section 1.4)
-8. âœ… Create materialized views for common patterns (Section 5.4)
-9. âœ… Add comprehensive documentation (Section 2.5)
-
-**Expected Impact:** Improve long-term scalability
-
-### Phase 4 (Enhancement - Ongoing):
-10. âœ… Implement monitoring and alerting (Section 5.5)
-11. âœ… Add unit tests (Section 6.2)
-12. âœ… Consider schema normalization (Section 6.1)
-
-**Expected Impact:** Operational excellence
+### Phase 4: Low Priority (Ongoing)
+12. **Code cleanup** (remove comments, standardize naming)
+13. **Documentation improvements**
+14. **Optimize indexes and distribution keys** (tune based on usage)
 
 ---
 
-## Summary
+## Estimated Impact Summary
 
-**Most Critical Issues:**
-1. ðŸ”´ String concatenation + 253 LIKE operations causing timeouts
-2. ðŸ”´ Hardcoded business logic preventing configuration changes
-3. ðŸ”´ No incremental load strategy for scaling
-
-**Quick Wins:**
-1. Remove commented code (5 minutes)
-2. Parameterize date ranges (30 minutes)
-3. Add query documentation (1 hour)
-
-**Highest ROI:**
-1. Replace CASE/LIKE with lookup table join (50-90% performance improvement)
-2. Externalize tracking code config (enables business user management)
-3. Implement incremental loads (enables scaling to larger date ranges)
+| Category | Current State | After Optimizations | Improvement |
+|----------|--------------|---------------------|-------------|
+| **Query Runtime** | ~30-60 min (estimated) | ~5-10 min | **70-85% faster** |
+| **Maintainability** | Low (hardcoded logic) | High (table-driven) | **Critical** |
+| **Scalability** | Limited (pattern matching) | Good (indexed lookups) | **10x headroom** |
+| **Data Quality** | Medium (implicit assumptions) | High (explicit validation) | **Significant** |
+| **Code Lines** | 500+ lines | ~200 lines (modular) | **60% reduction** |

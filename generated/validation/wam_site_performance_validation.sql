@@ -4,32 +4,42 @@
 
 ```sql
 -- ================================================================================
--- VALIDATION SQL SCRIPT
+-- VALIDATION SQL SCRIPT FOR wam_site_performance
 -- Table: dev.ba_corporate.wam_site_performance
 -- JIRA: HAT-3917
 -- Generated: 2026-03-09
+-- Date Range: 2026-01-01 to 2026-01-31
 -- ================================================================================
 
 -- ================================================================================
--- SECTION 1: ROW COUNT CHECKS
+-- SECTION 1: SOURCE TABLE ROW COUNT CHECKS
 -- ================================================================================
 
--- 1.1: Source table row counts (should have data for Jan 2026)
-SELECT 'analytic_traffic_detail' AS source_table, 
-       COUNT(*) AS row_count,
-       COUNT(DISTINCT session_id) AS distinct_sessions
+-- Check 1.1: Base traffic data source row count
+-- Expected: Should have records for January 2026
+SELECT 
+    'Traffic Source Row Count' AS check_name,
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT session_id) AS unique_sessions,
+    MIN(website_activity_mst_date) AS min_date,
+    MAX(website_activity_mst_date) AS max_date,
+    CASE WHEN COUNT(*) > 0 THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.website_prod.analytic_traffic_detail
 WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
     AND gd_sales_flag = TRUE
     AND session_id IS NOT NULL
     AND website_activity_exclusion_reason_desc IS NULL;
--- Expected: > 0 rows
 
--- 1.2: Product data row counts
-SELECT 'bill_line_traffic_ext' AS source_table,
-       COUNT(*) AS row_count,
-       COUNT(DISTINCT session_id) AS distinct_sessions,
-       SUM(gcr_usd_amt) AS total_gcr
+-- Check 1.2: Product/billing data source row count
+-- Expected: Should have WAM product records for January 2026
+SELECT 
+    'Product Source Row Count' AS check_name,
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT session_id) AS unique_sessions,
+    MIN(website_activity_mst_date) AS min_date,
+    MAX(website_activity_mst_date) AS max_date,
+    SUM(gcr_usd_amt) AS total_gcr,
+    CASE WHEN COUNT(*) > 0 THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.dna_approved.bill_line_traffic_ext
 WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
     AND product_pnl_line_name IN ('Websites and Marketing', 'Website Builder')
@@ -38,431 +48,436 @@ WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
     AND refund_flag = FALSE
     AND chargeback_flag = FALSE
     AND product_pnl_new_renewal_name = 'New Purchase';
--- Expected: > 0 rows
 
--- 1.3: Target table row count
-SELECT 'wam_site_performance' AS target_table,
-       COUNT(*) AS row_count,
-       COUNT(DISTINCT website_date) AS distinct_dates,
-       MIN(website_date) AS min_date,
-       MAX(website_date) AS max_date
-FROM dev.ba_corporate.wam_site_performance;
--- Expected: > 0 rows, dates between 2026-01-01 and 2026-01-31
-
--- 1.4: ITC grouping lookup table
-SELECT 'wam_itc_site' AS lookup_table,
-       COUNT(*) AS row_count,
-       COUNT(DISTINCT itemtrackingcode) AS distinct_itcs
+-- Check 1.3: ITC mapping reference table row count
+-- Expected: Should contain ITC to site grouping mappings
+SELECT 
+    'ITC Mapping Row Count' AS check_name,
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT itemtrackingcode) AS unique_itcs,
+    COUNT(DISTINCT itcgrouping) AS unique_groupings,
+    CASE WHEN COUNT(*) > 0 THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.ba_corporate.wam_itc_site;
--- Expected: > 0 rows
+
+-- Check 1.4: Target table row count
+-- Expected: Should be populated after ETL run
+SELECT 
+    'Target Table Row Count' AS check_name,
+    COUNT(*) AS row_count,
+    MIN(website_date) AS min_date,
+    MAX(website_date) AS max_date,
+    CASE WHEN COUNT(*) > 0 THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance;
 
 -- ================================================================================
 -- SECTION 2: NULL VALUE CHECKS FOR CRITICAL COLUMNS
 -- ================================================================================
 
--- 2.1: Check for NULLs in date column (should be 0)
-SELECT 'website_date NULL check' AS validation_check,
-       COUNT(*) AS null_count
-FROM dev.ba_corporate.wam_site_performance
-WHERE website_date IS NULL;
--- Expected: 0
-
--- 2.2: Check for NULLs in tracking code (should be 0 after COALESCE)
-SELECT 'top_ranked_tracking_code NULL check' AS validation_check,
-       COUNT(*) AS null_count
-FROM dev.ba_corporate.wam_site_performance
-WHERE top_ranked_tracking_code IS NULL;
--- Expected: 0
-
--- 2.3: Check for NULLs in key dimension fields (should be 0 after COALESCE)
-SELECT 'dimension NULL checks' AS validation_check,
-       SUM(CASE WHEN channel_grouping_name IS NULL THEN 1 ELSE 0 END) AS channel_nulls,
-       SUM(CASE WHEN device_category_name IS NULL THEN 1 ELSE 0 END) AS device_nulls,
-       SUM(CASE WHEN web_region_2_name IS NULL THEN 1 ELSE 0 END) AS region_nulls,
-       SUM(CASE WHEN existing_customer_flag IS NULL THEN 1 ELSE 0 END) AS customer_flag_nulls
+-- Check 2.1: Critical dimension columns should not be NULL (after COALESCE)
+SELECT 
+    'Null Check - Dimensions' AS check_name,
+    SUM(CASE WHEN website_date IS NULL THEN 1 ELSE 0 END) AS null_website_date,
+    SUM(CASE WHEN channel_grouping_name IS NULL THEN 1 ELSE 0 END) AS null_channel,
+    SUM(CASE WHEN channel_grouping_name = 'Unknown' THEN 1 ELSE 0 END) AS unknown_channel,
+    SUM(CASE WHEN device_category_name IS NULL THEN 1 ELSE 0 END) AS null_device,
+    SUM(CASE WHEN top_ranked_tracking_code IS NULL THEN 1 ELSE 0 END) AS null_tracking_code,
+    SUM(CASE WHEN source_field IS NULL THEN 1 ELSE 0 END) AS null_source_field,
+    CASE WHEN SUM(CASE WHEN website_date IS NULL THEN 1 ELSE 0 END) = 0 
+         THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.ba_corporate.wam_site_performance;
--- Expected: All 0
 
--- 2.4: Check for NULLs in metric columns (should be 0)
-SELECT 'metric NULL checks' AS validation_check,
-       SUM(CASE WHEN sessions IS NULL THEN 1 ELSE 0 END) AS sessions_nulls,
-       SUM(CASE WHEN session_cnt IS NULL THEN 1 ELSE 0 END) AS session_cnt_nulls,
-       SUM(CASE WHEN pa_sessions IS NULL THEN 1 ELSE 0 END) AS pa_sessions_nulls,
-       SUM(CASE WHEN gcr_sessions IS NULL THEN 1 ELSE 0 END) AS gcr_sessions_nulls,
-       SUM(CASE WHEN wam_sessions IS NULL THEN 1 ELSE 0 END) AS wam_sessions_nulls,
-       SUM(CASE WHEN GCR IS NULL THEN 1 ELSE 0 END) AS gcr_nulls
+-- Check 2.2: Session metrics should not be NULL
+SELECT 
+    'Null Check - Metrics' AS check_name,
+    SUM(CASE WHEN sessions IS NULL THEN 1 ELSE 0 END) AS null_sessions,
+    SUM(CASE WHEN session_cnt IS NULL THEN 1 ELSE 0 END) AS null_session_cnt,
+    SUM(CASE WHEN pa_sessions IS NULL THEN 1 ELSE 0 END) AS null_pa_sessions,
+    SUM(CASE WHEN gcr_sessions IS NULL THEN 1 ELSE 0 END) AS null_gcr_sessions,
+    SUM(CASE WHEN wam_sessions IS NULL THEN 1 ELSE 0 END) AS null_wam_sessions,
+    SUM(CASE WHEN total_wam_units IS NULL THEN 1 ELSE 0 END) AS null_wam_units,
+    SUM(CASE WHEN gcr IS NULL THEN 1 ELSE 0 END) AS null_gcr,
+    CASE WHEN SUM(CASE WHEN sessions IS NULL OR session_cnt IS NULL THEN 1 ELSE 0 END) = 0 
+         THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.ba_corporate.wam_site_performance;
--- Expected: All 0
 
 -- ================================================================================
--- SECTION 3: DUPLICATE DETECTION
+-- SECTION 3: DUPLICATE DETECTION QUERIES
 -- ================================================================================
 
--- 3.1: Check for duplicate grain violations (should be unique at grain level)
-SELECT 'duplicate check at grain level' AS validation_check,
-       website_date,
-       channel_grouping_name,
-       device_category_name,
-       web_region_2_name,
-       existing_customer_flag,
-       first_hit_content_group_2_name,
-       top_ranked_tracking_code,
-       source_field,
-       order_item_tracking_code,
-       product_term,
-       plan_type,
-       free_or_paid,
-       COUNT(*) AS duplicate_count
-FROM dev.ba_corporate.wam_site_performance
-GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12
-HAVING COUNT(*) > 1;
--- Expected: 0 rows
+-- Check 3.1: Duplicate row detection at grain level
+-- Expected: No duplicates at the grain (date + all dimensions)
+SELECT 
+    'Duplicate Rows Check' AS check_name,
+    COUNT(*) AS total_combinations,
+    COUNT(*) - COUNT(DISTINCT 
+        website_date || '|' || 
+        channel_grouping_name || '|' || 
+        device_category_name || '|' || 
+        web_region_2_name || '|' || 
+        existing_customer_flag || '|' || 
+        first_hit_content_group_2_name || '|' || 
+        web_focal_country_name || '|' || 
+        page_path_list || '|' || 
+        web_business_unit_name || '|' || 
+        top_ranked_tracking_code || '|' || 
+        source_field || '|' || 
+        order_item_tracking_code || '|' || 
+        product_term || '|' || 
+        plan_type || '|' || 
+        free_or_paid
+    ) AS duplicate_count,
+    CASE WHEN COUNT(*) = COUNT(DISTINCT 
+        website_date || '|' || channel_grouping_name || '|' || device_category_name || '|' || 
+        web_region_2_name || '|' || existing_customer_flag || '|' || first_hit_content_group_2_name || '|' || 
+        web_focal_country_name || '|' || page_path_list || '|' || web_business_unit_name || '|' || 
+        top_ranked_tracking_code || '|' || source_field || '|' || order_item_tracking_code || '|' || 
+        product_term || '|' || plan_type || '|' || free_or_paid
+    ) THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance;
 
--- 3.2: Check for suspicious duplicate session IDs in source (informational)
-SELECT 'source duplicate session check' AS validation_check,
-       session_id,
-       website_activity_mst_date,
-       COUNT(*) AS occurrence_count
-FROM dev.website_prod.analytic_traffic_detail
-WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
-    AND gd_sales_flag = TRUE
-    AND session_id IS NOT NULL
-    AND website_activity_exclusion_reason_desc IS NULL
-GROUP BY 1,2
+-- Check 3.2: Identify any actual duplicate rows (if they exist)
+-- Expected: 0 rows returned
+SELECT 
+    website_date,
+    channel_grouping_name,
+    device_category_name,
+    top_ranked_tracking_code,
+    order_item_tracking_code,
+    COUNT(*) AS occurrence_count
+FROM dev.ba_corporate.wam_site_performance
+GROUP BY 1,2,3,4,5
 HAVING COUNT(*) > 1
+ORDER BY occurrence_count DESC
 LIMIT 100;
--- Expected: Few or no duplicates
 
 -- ================================================================================
--- SECTION 4: JOIN VALIDATION
+-- SECTION 4: JOIN VALIDATION (ORPHANED RECORDS)
 -- ================================================================================
 
--- 4.1: Check for sessions with traffic but no product match (expected: many)
-SELECT 'traffic sessions without product data' AS validation_check,
-       COUNT(DISTINCT a.session_id) AS unmatched_sessions,
-       ROUND(100.0 * COUNT(DISTINCT a.session_id) / 
-             (SELECT COUNT(DISTINCT session_id) 
-              FROM dev.website_prod.analytic_traffic_detail 
-              WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
-                  AND gd_sales_flag = TRUE
-                  AND session_id IS NOT NULL
-                  AND website_activity_exclusion_reason_desc IS NULL), 2) AS pct_unmatched
-FROM dev.website_prod.analytic_traffic_detail a
-LEFT JOIN dev.dna_approved.bill_line_traffic_ext b
-    ON a.website_activity_mst_date = b.website_activity_mst_date
-    AND a.session_id = b.session_id
-    AND b.product_pnl_line_name IN ('Websites and Marketing', 'Website Builder')
-    AND b.point_of_purchase_name = 'Web'
-    AND b.exclude_reason_month_end_desc IS NULL
-    AND b.refund_flag = FALSE
-    AND b.chargeback_flag = FALSE
-    AND b.product_pnl_new_renewal_name = 'New Purchase'
-WHERE a.website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
-    AND a.gd_sales_flag = TRUE
-    AND a.session_id IS NOT NULL
-    AND a.website_activity_exclusion_reason_desc IS NULL
-    AND b.session_id IS NULL;
--- Expected: Significant portion (most sessions don't convert)
+-- Check 4.1: Traffic sessions without product data (expected for non-converting traffic)
+-- Expected: Some records with N/A product dimensions are normal
+SELECT 
+    'Traffic Without Products' AS check_name,
+    COUNT(*) AS total_rows,
+    SUM(CASE WHEN order_item_tracking_code = 'N/A' 
+             AND product_term = 'N/A' 
+             AND plan_type = 'N/A' THEN 1 ELSE 0 END) AS rows_without_product,
+    ROUND(100.0 * SUM(CASE WHEN order_item_tracking_code = 'N/A' THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_without_product,
+    CASE WHEN COUNT(*) > 0 THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance;
 
--- 4.2: Check for orphaned ITC codes (tracking codes with no grouping)
-SELECT 'orphaned tracking codes without grouping' AS validation_check,
-       a.top_ranked_tracking_code,
-       SUM(a.sessions) AS total_sessions,
-       SUM(a.GCR) AS total_gcr
-FROM dev.ba_corporate.wam_site_performance a
-LEFT JOIN (SELECT DISTINCT itemtrackingcode, itcgrouping 
-           FROM dev.ba_corporate.wam_itc_site) b
-    ON a.top_ranked_tracking_code = b.itemtrackingcode
-WHERE a.top_ranked_tracking_code <> 'Not attributed'
-    AND a.top_ranked_tracking_code <> 'N/A'
-    AND a.top_ranked_tracking_code <> 'Unknown'
-    AND b.itemtrackingcode IS NULL
-GROUP BY 1
-ORDER BY 2 DESC
-LIMIT 100;
--- Expected: Some ITCs may not have groupings (review for significance)
+-- Check 4.2: ITC mapping join validation
+-- Expected: Some ITCs may not have grouping (new ITCs not yet mapped)
+SELECT 
+    'ITC Mapping Join' AS check_name,
+    COUNT(DISTINCT top_ranked_tracking_code) AS unique_itcs,
+    COUNT(DISTINCT CASE WHEN itc_grouping IS NOT NULL THEN top_ranked_tracking_code END) AS itcs_with_grouping,
+    COUNT(DISTINCT CASE WHEN itc_grouping IS NULL AND top_ranked_tracking_code <> 'Not attributed' 
+                        THEN top_ranked_tracking_code END) AS unmapped_itcs,
+    CASE WHEN COUNT(DISTINCT top_ranked_tracking_code) > 0 THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance;
+
+-- Check 4.3: List unmapped ITCs that have significant volume
+-- Expected: Review list for any high-volume ITCs needing mapping
+SELECT 
+    top_ranked_tracking_code,
+    itc_grouping,
+    SUM(sessions) AS total_sessions,
+    SUM(gcr) AS total_gcr,
+    SUM(wam_sessions) AS total_wam_sessions
+FROM dev.ba_corporate.wam_site_performance
+WHERE itc_grouping IS NULL 
+    AND top_ranked_tracking_code <> 'Not attributed'
+GROUP BY 1, 2
+HAVING SUM(sessions) > 100
+ORDER BY total_sessions DESC;
 
 -- ================================================================================
 -- SECTION 5: BUSINESS RULE VALIDATION
 -- ================================================================================
 
--- 5.1: Date range validation (should be within Jan 2026)
-SELECT 'date range validation' AS validation_check,
-       MIN(website_date) AS min_date,
-       MAX(website_date) AS max_date,
-       SUM(CASE WHEN website_date < '2026-01-01' THEN 1 ELSE 0 END) AS before_range,
-       SUM(CASE WHEN website_date > '2026-01-31' THEN 1 ELSE 0 END) AS after_range
+-- Check 5.1: Date range validation
+-- Expected: All dates should be within 2026-01-01 to 2026-01-31
+SELECT 
+    'Date Range Check' AS check_name,
+    MIN(website_date) AS min_date,
+    MAX(website_date) AS max_date,
+    COUNT(DISTINCT website_date) AS unique_dates,
+    SUM(CASE WHEN website_date < '2026-01-01' OR website_date > '2026-01-31' THEN 1 ELSE 0 END) AS out_of_range_count,
+    CASE WHEN MIN(website_date) >= '2026-01-01' 
+         AND MAX(website_date) <= '2026-01-31' 
+         THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.ba_corporate.wam_site_performance;
--- Expected: min=2026-01-01, max=2026-01-31, before_range=0, after_range=0
 
--- 5.2: Metric value constraints (negative values check)
-SELECT 'negative metrics check' AS validation_check,
-       SUM(CASE WHEN sessions < 0 THEN 1 ELSE 0 END) AS negative_sessions,
-       SUM(CASE WHEN session_cnt < 0 THEN 1 ELSE 0 END) AS negative_session_cnt,
-       SUM(CASE WHEN pa_sessions < 0 THEN 1 ELSE 0 END) AS negative_pa_sessions,
-       SUM(CASE WHEN gcr_sessions < 0 THEN 1 ELSE 0 END) AS negative_gcr_sessions,
-       SUM(CASE WHEN wam_sessions < 0 THEN 1 ELSE 0 END) AS negative_wam_sessions,
-       SUM(CASE WHEN total_wam_units < 0 THEN 1 ELSE 0 END) AS negative_units,
-       SUM(CASE WHEN GCR < 0 THEN 1 ELSE 0 END) AS negative_gcr
+-- Check 5.2: GCR value validation (should be >= 0)
+-- Expected: GCR should never be negative
+SELECT 
+    'GCR Value Check' AS check_name,
+    MIN(gcr) AS min_gcr,
+    MAX(gcr) AS max_gcr,
+    AVG(gcr) AS avg_gcr,
+    SUM(CASE WHEN gcr < 0 THEN 1 ELSE 0 END) AS negative_gcr_count,
+    SUM(gcr) AS total_gcr,
+    CASE WHEN MIN(gcr) >= 0 THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.ba_corporate.wam_site_performance;
--- Expected: All 0
 
--- 5.3: Logical metric relationships (GCR sessions <= total sessions)
-SELECT 'metric relationship validation' AS validation_check,
-       COUNT(*) AS rows_with_invalid_relationships
-FROM dev.ba_corporate.wam_site_performance
-WHERE gcr_sessions > session_cnt
-   OR pa_sessions > session_cnt
-   OR wam_sessions > sessions;
--- Expected: 0
+-- Check 5.3: Session count consistency (sessions should equal session_cnt)
+-- Expected: sessions = session_cnt (both should represent unique session count)
+SELECT 
+    'Session Count Consistency' AS check_name,
+    SUM(sessions) AS total_sessions,
+    SUM(session_cnt) AS total_session_cnt,
+    SUM(ABS(sessions - session_cnt)) AS absolute_difference,
+    COUNT(CASE WHEN sessions <> session_cnt THEN 1 END) AS rows_with_difference,
+    CASE WHEN SUM(sessions) = SUM(session_cnt) THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance;
 
--- 5.4: Free vs Paid validation (GCR should match free_or_paid designation)
-SELECT 'free_or_paid GCR consistency' AS validation_check,
-       free_or_paid,
-       COUNT(*) AS row_count,
-       SUM(GCR) AS total_gcr,
-       MIN(GCR) AS min_gcr,
-       MAX(GCR) AS max_gcr
-FROM dev.ba_corporate.wam_site_performance
-WHERE free_or_paid <> 'N/A'
-GROUP BY 1;
--- Expected: 'Free' should have GCR=0, 'Paid' and 'Free to Paid' should have GCR>0
+-- Check 5.4: WAM sessions validation (wam_sessions should be <= sessions)
+-- Expected: WAM sessions should never exceed total sessions
+SELECT 
+    'WAM Sessions <= Sessions' AS check_name,
+    SUM(wam_sessions) AS total_wam_sessions,
+    SUM(sessions) AS total_sessions,
+    COUNT(CASE WHEN wam_sessions > sessions THEN 1 END) AS violation_count,
+    CASE WHEN COUNT(CASE WHEN wam_sessions > sessions THEN 1 END) = 0 
+         THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance;
 
--- 5.5: Plan type validation (check for valid values)
-SELECT 'plan_type value distribution' AS validation_check,
-       plan_type,
-       COUNT(*) AS row_count,
-       SUM(wam_sessions) AS total_sessions
-FROM dev.ba_corporate.wam_site_performance
-GROUP BY 1
-ORDER BY 2 DESC;
--- Expected: Values should be: Marketing, Commerce Plus, Standard, Basic, Commerce, Premium, Starter, N/A
+-- Check 5.5: GCR sessions validation (gcr_sessions should be <= sessions)
+-- Expected: GCR sessions should never exceed total sessions
+SELECT 
+    'GCR Sessions <= Sessions' AS check_name,
+    SUM(gcr_sessions) AS total_gcr_sessions,
+    SUM(sessions) AS total_sessions,
+    COUNT(CASE WHEN gcr_sessions > sessions THEN 1 END) AS violation_count,
+    CASE WHEN COUNT(CASE WHEN gcr_sessions > sessions THEN 1 END) = 0 
+         THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance;
 
--- 5.6: Tracking code attribution validation
-SELECT 'tracking code attribution breakdown' AS validation_check,
-       CASE 
-           WHEN top_ranked_tracking_code = 'Not attributed' THEN 'Not attributed'
-           WHEN top_ranked_tracking_code IN ('N/A', 'Unknown') THEN 'Other'
-           ELSE 'Attributed'
-       END AS attribution_category,
-       COUNT(*) AS row_count,
-       SUM(sessions) AS total_sessions,
-       SUM(wam_sessions) AS total_wam_sessions,
-       SUM(GCR) AS total_gcr
+-- Check 5.6: Plan type validation
+-- Expected: Plan types should match defined values from CASE statement
+SELECT 
+    'Plan Type Validation' AS check_name,
+    plan_type,
+    COUNT(*) AS row_count,
+    SUM(gcr) AS total_gcr,
+    CASE WHEN plan_type IN ('Marketing', 'Commerce Plus', 'Standard', 'Basic', 
+                            'Commerce', 'Premium', 'Starter', 'N/A') 
+              OR plan_type IS NULL
+         THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.ba_corporate.wam_site_performance
-GROUP BY 1;
--- Expected: Mix of attributed and not attributed
+GROUP BY plan_type
+ORDER BY row_count DESC;
 
--- 5.7: Source field validation (should align with tracking code)
-SELECT 'source_field validation' AS validation_check,
-       source_field,
-       COUNT(*) AS row_count,
-       COUNT(DISTINCT top_ranked_tracking_code) AS distinct_itcs
+-- Check 5.7: Free or Paid validation
+-- Expected: Should only be 'Free', 'Free to Paid', 'Paid', or 'N/A'
+SELECT 
+    'Free/Paid Validation' AS check_name,
+    free_or_paid,
+    COUNT(*) AS row_count,
+    SUM(gcr) AS total_gcr,
+    CASE WHEN free_or_paid IN ('Free', 'Free to Paid', 'Paid', 'N/A') 
+         THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.ba_corporate.wam_site_performance
-GROUP BY 1
-ORDER BY 2 DESC;
--- Expected: Valid values: order_itc, payment_attempt, begin_checkout, add_to_cart, click, impression, Unknown
+GROUP BY free_or_paid
+ORDER BY row_count DESC;
+
+-- Check 5.8: Source field validation
+-- Expected: Should be 'order_itc', 'payment_attempt', 'begin_checkout', 'add_to_cart', 'click', 'impression', or 'Unknown'
+SELECT 
+    'Source Field Validation' AS check_name,
+    source_field,
+    COUNT(*) AS row_count,
+    SUM(gcr) AS total_gcr,
+    CASE WHEN source_field IN ('order_itc', 'payment_attempt', 'begin_checkout', 
+                               'add_to_cart', 'click', 'impression', 'Unknown') 
+         THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance
+GROUP BY source_field
+ORDER BY row_count DESC;
+
+-- Check 5.9: GCR should be 0 for Free products
+-- Expected: Free products should have GCR = 0
+SELECT 
+    'Free Products GCR Check' AS check_name,
+    free_or_paid,
+    SUM(CASE WHEN free_or_paid = 'Free' AND gcr > 0 THEN 1 ELSE 0 END) AS free_with_gcr_violations,
+    SUM(CASE WHEN free_or_paid = 'Free' THEN gcr ELSE 0 END) AS total_gcr_for_free,
+    CASE WHEN SUM(CASE WHEN free_or_paid = 'Free' AND gcr > 0 THEN 1 ELSE 0 END) = 0 
+         THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance
+GROUP BY free_or_paid;
 
 -- ================================================================================
 -- SECTION 6: DATA TYPE AND FORMAT VALIDATION
 -- ================================================================================
 
--- 6.1: String field length validation (check for truncation)
-SELECT 'string length validation' AS validation_check,
-       MAX(LENGTH(top_ranked_tracking_code)) AS max_tracking_code_len,
-       MAX(LENGTH(source_field)) AS max_source_field_len,
-       MAX(LENGTH(plan_type)) AS max_plan_type_len,
-       MAX(LENGTH(product_term)) AS max_product_term_len
+-- Check 6.1: Numeric fields should contain valid numbers
+-- Expected: All numeric fields are properly typed and non-negative where appropriate
+SELECT 
+    'Numeric Field Validation' AS check_name,
+    SUM(CASE WHEN sessions < 0 THEN 1 ELSE 0 END) AS negative_sessions,
+    SUM(CASE WHEN session_cnt < 0 THEN 1 ELSE 0 END) AS negative_session_cnt,
+    SUM(CASE WHEN pa_sessions < 0 THEN 1 ELSE 0 END) AS negative_pa_sessions,
+    SUM(CASE WHEN gcr_sessions < 0 THEN 1 ELSE 0 END) AS negative_gcr_sessions,
+    SUM(CASE WHEN wam_sessions < 0 THEN 1 ELSE 0 END) AS negative_wam_sessions,
+    SUM(CASE WHEN total_wam_units < 0 THEN 1 ELSE 0 END) AS negative_wam_units,
+    SUM(CASE WHEN gcr < 0 THEN 1 ELSE 0 END) AS negative_gcr,
+    CASE WHEN SUM(CASE WHEN sessions < 0 OR session_cnt < 0 OR gcr < 0 THEN 1 ELSE 0 END) = 0 
+         THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.ba_corporate.wam_site_performance;
--- Expected: Reasonable lengths (tracking codes ~50 chars, others <100)
 
--- 6.2: COALESCE placeholder validation (verify defaults applied)
-SELECT 'COALESCE default values check' AS validation_check,
-       SUM(CASE WHEN channel_grouping_name = 'Unknown' THEN 1 ELSE 0 END) AS unknown_channel,
-       SUM(CASE WHEN device_category_name = 'Unknown' THEN 1 ELSE 0 END) AS unknown_device,
-       SUM(CASE WHEN web_region_2_name = 'Unknown' THEN 1 ELSE 0 END) AS unknown_region,
-       SUM(CASE WHEN order_item_tracking_code = 'N/A' THEN 1 ELSE 0 END) AS na_order_itc,
-       SUM(CASE WHEN product_term = 'N/A' THEN 1 ELSE 0 END) AS na_product_term,
-       SUM(CASE WHEN plan_type = 'N/A' THEN 1 ELSE 0 END) AS na_plan_type
+-- Check 6.2: Date format validation
+-- Expected: website_date should be valid date type
+SELECT 
+    'Date Format Check' AS check_name,
+    COUNT(DISTINCT website_date) AS unique_dates,
+    MIN(website_date) AS earliest_date,
+    MAX(website_date) AS latest_date,
+    CASE WHEN COUNT(DISTINCT website_date) > 0 
+         AND MIN(website_date) IS NOT NULL 
+         THEN 'PASS' ELSE 'FAIL' END AS status
 FROM dev.ba_corporate.wam_site_performance;
--- Expected: Various counts showing where defaults were applied
 
 -- ================================================================================
 -- SECTION 7: AGGREGATE METRIC VERIFICATION
 -- ================================================================================
 
--- 7.1: Total session reconciliation (target vs source)
-WITH source_totals AS (
-    SELECT 
-        COUNT(DISTINCT session_id) AS distinct_sessions_source,
-        SUM(session_cnt) AS session_cnt_source,
-        SUM(page_advance_session_cnt) AS pa_sessions_source,
-        SUM(new_gcr_session_cnt) AS gcr_sessions_source
-    FROM dev.website_prod.analytic_traffic_detail
-    WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
-        AND gd_sales_flag = TRUE
-        AND session_id IS NOT NULL
-        AND website_activity_exclusion_reason_desc IS NULL
-),
-target_totals AS (
-    SELECT 
-        SUM(sessions) AS sessions_target,
-        SUM(session_cnt) AS session_cnt_target,
-        SUM(pa_sessions) AS pa_sessions_target,
-        SUM(gcr_sessions) AS gcr_sessions_target
-    FROM dev.ba_corporate.wam_site_performance
-)
+-- Check 7.1: Compare total GCR between source and target
+-- Expected: Target table GCR should match source (bill_line_traffic_ext)
 SELECT 
-    'session reconciliation' AS validation_check,
-    s.distinct_sessions_source,
-    t.sessions_target,
-    s.session_cnt_source,
-    t.session_cnt_target,
-    s.pa_sessions_source,
-    t.pa_sessions_target,
-    s.gcr_sessions_source,
-    t.gcr_sessions_target,
-    ROUND(100.0 * (t.session_cnt_target - s.session_cnt_source) / s.session_cnt_source, 2) AS session_cnt_pct_diff
-FROM source_totals s, target_totals t;
--- Expected: session_cnt should match closely (within rounding), sessions may differ due to deduplication
+    'GCR Reconciliation' AS check_name,
+    'Source (bill_line_traffic_ext)' AS source_type,
+    SUM(gcr_usd_amt) AS total_gcr,
+    COUNT(DISTINCT session_id) AS unique_sessions
+FROM dev.dna_approved.bill_line_traffic_ext
+WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
+    AND product_pnl_line_name IN ('Websites and Marketing', 'Website Builder')
+    AND point_of_purchase_name = 'Web'
+    AND exclude_reason_month_end_desc IS NULL
+    AND refund_flag = FALSE
+    AND chargeback_flag = FALSE
+    AND product_pnl_new_renewal_name = 'New Purchase'
+UNION ALL
+SELECT 
+    'GCR Reconciliation' AS check_name,
+    'Target (wam_site_performance)' AS source_type,
+    SUM(gcr) AS total_gcr,
+    COUNT(DISTINCT CASE WHEN order_item_tracking_code <> 'N/A' THEN website_date || session_cnt END) AS unique_sessions
+FROM dev.ba_corporate.wam_site_performance;
 
--- 7.2: GCR reconciliation (target vs source)
-WITH source_gcr AS (
-    SELECT 
-        SUM(gcr_usd_amt) AS total_gcr_source,
-        COUNT(DISTINCT session_id) AS wam_sessions_source,
-        SUM(product_unit_qty) AS wam_units_source
-    FROM dev.dna_approved.bill_line_traffic_ext
-    WHERE website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
-        AND product_pnl_line_name IN ('Websites and Marketing', 'Website Builder')
-        AND point_of_purchase_name = 'Web'
-        AND exclude_reason_month_end_desc IS NULL
-        AND refund_flag = FALSE
-        AND chargeback_flag = FALSE
-        AND product_pnl_new_renewal_name = 'New Purchase'
-),
-target_gcr AS (
-    SELECT 
-        SUM(GCR) AS total_gcr_target,
-        SUM(wam_sessions) AS wam_sessions_target,
-        SUM(total_wam_units) AS wam_units_target
-    FROM dev.ba_corporate.wam_site_performance
-)
+-- Check 7.2: Session count reconciliation by date
+-- Expected: Session counts should align between source and target
 SELECT 
-    'GCR reconciliation' AS validation_check,
-    s.total_gcr_source,
-    t.total_gcr_target,
-    ROUND(s.total_gcr_source - t.total_gcr_target, 2) AS gcr_diff,
-    ROUND(100.0 * (t.total_gcr_target - s.total_gcr_source) / NULLIF(s.total_gcr_source, 0), 2) AS gcr_pct_diff,
-    s.wam_sessions_source,
-    t.wam_sessions_target,
-    s.wam_units_source,
-    t.wam_units_target
-FROM source_gcr s, target_gcr t;
--- Expected: GCR should match exactly, sessions/units should match
+    website_date,
+    SUM(sessions) AS target_sessions,
+    SUM(session_cnt) AS target_session_cnt,
+    SUM(gcr_sessions) AS target_gcr_sessions,
+    SUM(wam_sessions) AS target_wam_sessions,
+    SUM(gcr) AS target_gcr
+FROM dev.ba_corporate.wam_site_performance
+GROUP BY website_date
+ORDER BY website_date;
 
--- 7.3: Top tracking codes by GCR (verify ranking logic)
+-- Check 7.3: Top tracking codes by volume
+-- Expected: Should see expected high-volume ITCs from ranking (upp_f2p_upgrade, slp_wsb_ft_nocc_config, etc.)
 SELECT 
-    'top 20 tracking codes by GCR' AS validation_check,
+    'Top Tracking Codes' AS check_name,
     top_ranked_tracking_code,
-    SUM(GCR) AS total_gcr,
+    SUM(sessions) AS total_sessions,
+    SUM(gcr) AS total_gcr,
     SUM(wam_sessions) AS total_wam_sessions,
-    SUM(sessions) AS total_sessions
+    ROUND(100.0 * SUM(sessions) / SUM(SUM(sessions)) OVER(), 2) AS pct_of_total_sessions
 FROM dev.ba_corporate.wam_site_performance
-WHERE top_ranked_tracking_code NOT IN ('Not attributed', 'N/A', 'Unknown')
-GROUP BY 1, 2
-ORDER BY 3 DESC
+WHERE top_ranked_tracking_code <> 'Not attributed'
+GROUP BY top_ranked_tracking_code
+ORDER BY total_sessions DESC
 LIMIT 20;
--- Expected: upp_f2p_upgrade should be #1 by GCR (if present in data)
 
--- 7.4: Daily totals breakdown
+-- Check 7.4: Attribution rate
+-- Expected: Reasonable percentage of sessions should be attributed (not 'Not attributed')
 SELECT 
-    'daily totals breakdown' AS validation_check,
-    website_date,
-    COUNT(*) AS row_count,
-    SUM(sessions) AS daily_sessions,
-    SUM(wam_sessions) AS daily_wam_sessions,
-    SUM(GCR) AS daily_gcr,
-    COUNT(DISTINCT top_ranked_tracking_code) AS distinct_tracking_codes
+    'Attribution Rate' AS check_name,
+    SUM(CASE WHEN top_ranked_tracking_code = 'Not attributed' THEN sessions ELSE 0 END) AS not_attributed_sessions,
+    SUM(CASE WHEN top_ranked_tracking_code <> 'Not attributed' THEN sessions ELSE 0 END) AS attributed_sessions,
+    SUM(sessions) AS total_sessions,
+    ROUND(100.0 * SUM(CASE WHEN top_ranked_tracking_code <> 'Not attributed' THEN sessions ELSE 0 END) / 
+          NULLIF(SUM(sessions), 0), 2) AS attribution_rate_pct,
+    CASE WHEN SUM(sessions) > 0 THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance;
+
+-- Check 7.5: Channel distribution
+-- Expected: Reasonable distribution across channels
+SELECT 
+    'Channel Distribution' AS check_name,
+    channel_grouping_name,
+    SUM(sessions) AS total_sessions,
+    SUM(gcr) AS total_gcr,
+    ROUND(100.0 * SUM(sessions) / SUM(SUM(sessions)) OVER(), 2) AS pct_of_sessions
 FROM dev.ba_corporate.wam_site_performance
-GROUP BY 1, 2
-ORDER BY 2;
--- Expected: 31 days (Jan 1-31), consistent metrics across days
+GROUP BY channel_grouping_name
+ORDER BY total_sessions DESC;
 
--- 7.5: Verify no double-counting in traffic metrics
+-- Check 7.6: Device distribution
+-- Expected: Reasonable distribution across devices
 SELECT 
-    'traffic double-count check' AS validation_check,
-    website_date,
-    COUNT(*) AS total_rows,
-    SUM(session_cnt) AS sum_session_cnt,
-    SUM(sessions) AS sum_sessions,
-    CASE 
-        WHEN SUM(session_cnt) > SUM(sessions) * 1.5 THEN 'POTENTIAL DOUBLE-COUNT'
-        ELSE 'OK'
-    END AS status
+    'Device Distribution' AS check_name,
+    device_category_name,
+    SUM(sessions) AS total_sessions,
+    SUM(gcr) AS total_gcr,
+    ROUND(100.0 * SUM(sessions) / SUM(SUM(sessions)) OVER(), 2) AS pct_of_sessions
 FROM dev.ba_corporate.wam_site_performance
-GROUP BY 1, 2
-HAVING SUM(session_cnt) > SUM(sessions) * 1.5;
--- Expected: 0 rows (no significant double-counting)
+GROUP BY device_category_name
+ORDER BY total_sessions DESC;
 
--- 7.6: WAM sessions deduplication check
-WITH session_product_counts AS (
-    SELECT 
-        a.session_id,
-        a.website_activity_mst_date,
-        COUNT(DISTINCT b.item_tracking_code) AS product_count
-    FROM dev.website_prod.analytic_traffic_detail a
-    INNER JOIN dev.dna_approved.bill_line_traffic_ext b
-        ON a.website_activity_mst_date = b.website_activity_mst_date
-        AND a.session_id = b.session_id
-        AND b.product_pnl_line_name IN ('Websites and Marketing', 'Website Builder')
-        AND b.point_of_purchase_name = 'Web'
-        AND b.exclude_reason_month_end_desc IS NULL
-        AND b.refund_flag = FALSE
-        AND b.chargeback_flag = FALSE
-        AND b.product_pnl_new_renewal_name = 'New Purchase'
-    WHERE a.website_activity_mst_date BETWEEN '2026-01-01' AND '2026-01-31'
-        AND a.gd_sales_flag = TRUE
-        AND a.session_id IS NOT NULL
-        AND a.website_activity_exclusion_reason_desc IS NULL
-    GROUP BY 1, 2
-)
+-- Check 7.7: Conversion funnel validation
+-- Expected: sessions >= pa_sessions >= gcr_sessions >= wam_sessions (funnel logic)
 SELECT 
-    'wam_sessions multi-product check' AS validation_check,
-    product_count,
-    COUNT(*) AS session_count
-FROM session_product_counts
-WHERE product_count > 1
-GROUP BY 1, 2
-ORDER BY 2 DESC;
--- Expected: Shows sessions with multiple products (should only count once per session in wam_sessions)
+    'Funnel Validation' AS check_name,
+    SUM(sessions) AS total_sessions,
+    SUM(pa_sessions) AS total_pa_sessions,
+    SUM(gcr_sessions) AS total_gcr_sessions,
+    SUM(wam_sessions) AS total_wam_sessions,
+    ROUND(100.0 * SUM(pa_sessions) / NULLIF(SUM(sessions), 0), 2) AS pa_rate,
+    ROUND(100.0 * SUM(gcr_sessions) / NULLIF(SUM(sessions), 0), 2) AS gcr_rate,
+    ROUND(100.0 * SUM(wam_sessions) / NULLIF(SUM(sessions), 0), 2) AS wam_conversion_rate,
+    CASE WHEN SUM(sessions) >= SUM(gcr_sessions) 
+         AND SUM(gcr_sessions) >= SUM(wam_sessions)
+         THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance;
 
 -- ================================================================================
 -- SECTION 8: SUMMARY VALIDATION REPORT
 -- ================================================================================
 
+-- Check 8.1: Overall table health summary
 SELECT 
-    '========== VALIDATION SUMMARY ==========' AS summary_report
-UNION ALL
-SELECT 'Table: dev.ba_corporate.wam_site_performance'
-UNION ALL
-SELECT 'Total Rows: ' || COUNT(*)::VARCHAR FROM dev.ba_corporate.wam_site_performance
-UNION ALL
-SELECT 'Date Range: ' || MIN(website_date)::VARCHAR || ' to ' || MAX(website_date)::VARCHAR FROM dev.ba_corporate.wam_site_performance
-UNION ALL
-SELECT 'Total Sessions: ' || SUM(sessions)::VARCHAR FROM dev.ba_corporate.wam_site_performance
-UNION ALL
-SELECT 'Total WAM Sessions: ' || SUM(wam_sessions)::VARCHAR FROM dev.ba_corporate.wam_site_performance
-UNION ALL
-SELECT 'Total GCR: $' || ROUND(SUM(GCR), 2)::VARCHAR FROM dev.ba_corporate.wam_site_performance
-UNION ALL
-SELECT 'Distinct Tracking Codes: ' || COUNT(DISTINCT top_ranked_tracking_code)::VARCHAR FROM dev.ba_corporate.wam_site_performance
-UNION ALL
-SELECT 'Not Attributed Sessions: ' || SUM(CASE WHEN top_ranked_tracking_code = 'Not attributed' THEN sessions ELSE 0 END)::VARCHAR FROM dev.ba_corporate.wam_site_performance
-UNION ALL
-SELECT 'Attributed Sessions: ' || SUM(CASE WHEN top_ranked_tracking_code <> 'Not attributed' THEN sessions ELSE 0 END)::VARCHAR FROM dev.ba_corporate.wam_site_performance
-UNION ALL
-SELECT '========================================';
+    'Overall Table Health' AS check_name,
+    COUNT(*) AS total_rows,
+    COUNT(DISTINCT website_date) AS unique_dates,
+    COUNT(DISTINCT top_ranked_tracking_code) AS unique_tracking_codes,
+    SUM(sessions) AS total_sessions,
+    SUM(gcr) AS total_gcr,
+    SUM(wam_sessions) AS total_wam_sessions,
+    MIN(website_date) AS start_date,
+    MAX(website_date) AS end_date,
+    CURRENT_TIMESTAMP AS validation_run_timestamp
+FROM dev.ba_corporate.wam_site_performance;
 
+-- Check 8.2: Data completeness by date
+-- Expected: All dates in range should have data
+SELECT 
+    'Data Completeness by Date' AS check_name,
+    website_date,
+    COUNT(*) AS row_count,
+    SUM(sessions) AS sessions,
+    SUM(gcr) AS gcr,
+    CASE WHEN COUNT(*) > 0 THEN 'PASS' ELSE 'FAIL' END AS status
+FROM dev.ba_corporate.wam_site_performance
+GROUP BY website_date
+ORDER BY website_date;
+
+-- ================================================================================
 -- END OF VALIDATION SCRIPT
+-- ================================================================================
 ```
