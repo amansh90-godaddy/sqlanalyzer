@@ -1,4 +1,4 @@
-# SQL Analyzer Project
+    # SQL Analyzer Project
 
 This project provides tools for analyzing SQL queries, generating validation queries, documentation, and improvement suggestions.
 

@@ -1,0 +1,32 @@
+# SQL Analyzer Configuration
+# Copy this file to config.yaml and fill in your values:
+#   cp config.example.yaml config.yaml
+
+# Claude API Configuration
+claude:
+  # Authentication method: "cli" (Claude Code CLI) or "api" (direct API key)
+  auth_method: "cli"
+  # API key (only needed if auth_method is "api")
+  # Generate at: https://console.anthropic.com/settings/keys
+  api_key: "sk-ant-..."
+  # Model to use when calling the API directly
+  model: "claude-sonnet-4-20250514"
+  # Timeout in seconds for each Claude call
+  timeout: 240
+
+# JIRA / Atlassian Configuration
+jira:
+  enabled: true
+  base_url: "https://your-domain.atlassian.net"
+  # Authentication: your Atlassian email + API token
+  # Generate API token at: https://id.atlassian.com/manage-profile/security/api-tokens
+  email: "you@company.com"
+  api_token: "your-jira-api-token"
+  # Default project key (used if no ticket found in SQL comments)
+  default_project: "PROJ"
+
+# Output Configuration
+output:
+  validation_dir: "generated/validation"
+  documentation_dir: "generated/documentation"
+  improvements_dir: "generated/improvements"
